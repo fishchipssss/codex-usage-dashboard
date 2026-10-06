@@ -53,8 +53,9 @@ npx github:luyh7/codex-usage-dashboard -- --open
 - Default project view, grouped by environment and workspace, with switches for recent and total-token list views.
 - Expandable main-agent task rows that show the combined usage of the main agent and its subagents, with nested subagent detail on demand.
 - Compact list columns for total tokens, output tokens, cost, cache hit rate, turns, model, and reasoning effort.
-- Detail view with token breakdown, estimated dollar cost, and hoverable unit prices for input, cached input, cache writes, output, and reasoning.
+- Detail view with token breakdown, estimated dollar cost, and hoverable unit prices for input, cached input, output, and reasoning.
 - Effective-dated pricing with per-request GPT-5.6 short/long context tiers, so earlier usage is not repriced when a new model launches.
+- GPT-6 Astra, Sol, Luna and GPT-6.1 Sol pricing, including the 272K input-token context boundary and Fast mode. Sol/Luna rates start September 22, 2026; GPT-6.1 Sol rates start September 29, 2026. Official launch dates have no published time, so the dashboard uses UTC midnight. GPT-6 Sol and GPT-6.1 Sol keep distinct cached-input rates ($0.20 and $0.10 per 1M tokens in short context). Sources: [pricing](https://developers.openai.com/api/docs/pricing), [changelog](https://developers.openai.com/api/docs/changelog).
 - Fast mode detection from each session's recorded service tier, using published model-specific Fast rates (2x for the GPT-5.6 family).
 - Fork-aware subagent accounting: inherited parent history is removed from child totals, costs, and timelines instead of being counted again.
 - Token-count timeline with latest entries shown first.

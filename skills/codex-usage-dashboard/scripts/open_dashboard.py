@@ -72,6 +72,7 @@ def health_dashboard_url(port: int, host: str = DEFAULT_HOST) -> str | None:
         and "session-inventory-cache-v1" in features
         and "effective-dated-pricing-v1" in features
         and "gpt-6-astra-pricing-v1" in features
+        and "gpt-6-family-pricing-v1" in features
         and "runtime-log-service-tier-v1" in features
         and "latest-service-tier-badge-v2" in features
         and "bounded-period-scan-v1" in features

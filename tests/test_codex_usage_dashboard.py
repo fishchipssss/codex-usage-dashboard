@@ -960,7 +960,7 @@ class CodexUsageDashboardTests(unittest.TestCase):
                 "gpt-5.6-sol",
                 "2026-07-09T17:00:00Z",
             ),
-            68.5,
+            66.0,
         )
         self.assertEqual(
             dashboard.estimate_cost_usd(
@@ -968,7 +968,7 @@ class CodexUsageDashboardTests(unittest.TestCase):
                 "gpt-5.6",
                 "2026-07-10T01:00:00+08:00",
             ),
-            68.5,
+            66.0,
         )
         self.assertEqual(
             dashboard.estimate_cost_usd(
@@ -976,7 +976,7 @@ class CodexUsageDashboardTests(unittest.TestCase):
                 "gpt-5.6-terra",
                 "2026-07-09T17:00:00Z",
             ),
-            34.25,
+            33.0,
         )
         self.assertEqual(
             dashboard.estimate_cost_usd(
@@ -984,7 +984,7 @@ class CodexUsageDashboardTests(unittest.TestCase):
                 "gpt-5.6-luna",
                 "2026-07-09T17:00:00Z",
             ),
-            13.7,
+            13.2,
         )
         self.assertEqual(
             dashboard.price_for_model(
@@ -1060,19 +1060,19 @@ class CodexUsageDashboardTests(unittest.TestCase):
         )
         self.assertEqual(
             dashboard.estimate_cost_usd(usage, "gpt-5.6-terra", before_update),
-            34.25,
+            33.0,
         )
         self.assertEqual(
             dashboard.estimate_cost_usd(usage, "gpt-5.6-terra", at_update),
-            27.4,
+            26.4,
         )
         self.assertEqual(
             dashboard.estimate_cost_usd(usage, "gpt-5.6-luna", before_update),
-            13.7,
+            13.2,
         )
         self.assertEqual(
             dashboard.estimate_cost_usd(usage, "gpt-5.6-luna", at_update),
-            2.74,
+            2.64,
         )
         self.assertEqual(
             dashboard.price_entry_for_model("gpt-5.6-terra", at_update)["effective_at"],
@@ -1204,8 +1204,8 @@ for (const service_tier of ['default', 'standard', '']) {
 
     def test_gpt_6_astra_effective_date_context_and_fast_pricing(self) -> None:
         self.assertIsNone(dashboard.price_for_model("gpt-6-astra", "2026-09-02T23:59:59Z"))
-        short = {"input": 10.0, "cached_input": 1.0, "cache_write_input": 12.5, "output": 50.0}
-        long = {"input": 20.0, "cached_input": 2.0, "cache_write_input": 25.0, "output": 75.0}
+        short = {"input": 10.0, "cached_input": 1.0, "output": 50.0}
+        long = {"input": 20.0, "cached_input": 2.0, "output": 75.0}
         for timestamp in ("2026-09-03T00:00:00Z", "2026-09-05T00:00:00Z", None):
             for model in ("gpt-6-astra", "jws/gpt-6-astra"):
                 for tokens, rates, tier in ((272_000, short, "short"), (272_001, long, "long")):
@@ -1217,11 +1217,50 @@ for (const service_tier of ['default', 'standard', '']) {
                             self.assertEqual(entry["context_tier"], tier)
                             self.assertEqual(entry["effective_at"], "2026-09-03T00:00:00Z")
         usage = {"input_tokens": 200_000, "cached_input_tokens": 50_000, "cache_write_tokens": 50_000, "output_tokens": 10_000}
-        self.assertAlmostEqual(dashboard.estimate_cost_usd(usage, "gpt-6-astra"), 2.175)
-        self.assertAlmostEqual(dashboard.estimate_cost_usd(usage, "gpt-6-astra", service_tier="priority"), 4.35)
+        # Cache writes are billed as ordinary uncached input, not a 1.25x line.
+        self.assertAlmostEqual(dashboard.estimate_cost_usd(usage, "gpt-6-astra"), 2.05)
+        self.assertAlmostEqual(dashboard.estimate_cost_usd(usage, "gpt-6-astra", service_tier="priority"), 4.1)
         usage["input_tokens"] = 300_000
-        self.assertAlmostEqual(dashboard.estimate_cost_usd(usage, "gpt-6-astra"), 6.1)
-        self.assertAlmostEqual(dashboard.estimate_cost_usd(usage, "gpt-6-astra", service_tier="priority"), 12.2)
+        self.assertAlmostEqual(dashboard.estimate_cost_usd(usage, "gpt-6-astra"), 5.85)
+        self.assertAlmostEqual(dashboard.estimate_cost_usd(usage, "gpt-6-astra", service_tier="priority"), 11.7)
+
+    def test_gpt_6_sol_luna_and_6_1_launch_context_and_fast_prices(self) -> None:
+        models = (
+            ("gpt-6-sol", "2026-09-22T00:00:00Z", "2026-09-21T23:59:59Z", 2.0, 0.2, 10.0),
+            ("gpt-6-luna", "2026-09-22T00:00:00Z", "2026-09-21T23:59:59Z", 0.1, 0.01, 0.5),
+            ("gpt-6.1-sol", "2026-09-29T00:00:00Z", "2026-09-28T23:59:59Z", 2.0, 0.1, 10.0),
+        )
+        for model, launch, before, input_rate, cached_rate, output_rate in models:
+            self.assertIsNone(dashboard.price_for_model(model, before))
+            for timestamp in (launch, "2026-10-07T00:00:00Z", None):
+                for name in (model, "jws/" + model, model + "-2026-10-01"):
+                    for tokens, context in ((272_000, "short"), (272_001, "long")):
+                        rates = {
+                            "input": input_rate * (2 if context == "long" else 1),
+                            "cached_input": cached_rate * (2 if context == "long" else 1),
+                            "output": output_rate * (1.5 if context == "long" else 1),
+                        }
+                        for tier, multiplier in (("default", 1), ("priority", 2), ("fast", 2)):
+                            with self.subTest(model=name, timestamp=timestamp, context=context, tier=tier):
+                                entry = dashboard.price_entry_for_model(name, timestamp, tokens, tier)
+                                self.assertIsNotNone(entry)
+                                self.assertEqual(entry["prices"], {key: value * multiplier for key, value in rates.items()})
+                                self.assertEqual(entry["context_tier"], context)
+                                self.assertEqual(entry["effective_at"], launch)
+
+    def test_gpt_6_to_6_1_session_keeps_each_events_cached_input_price(self) -> None:
+        usage = {"input_tokens": 200_000, "cached_input_tokens": 150_000, "output_tokens": 10_000}
+        timeline = [
+            {"timestamp": "2026-09-28T23:59:59Z", "model": "gpt-6-sol", "total_token_usage": usage},
+            {"timestamp": "2026-09-29T00:00:00Z", "model": "gpt-6.1-sol", "total_token_usage": {key: value * 2 for key, value in usage.items()}},
+        ]
+        pricing = dashboard.pricing_for_timeline(timeline, "gpt-6.1-sol")
+        self.assertTrue(pricing["price_model_known"])
+        self.assertAlmostEqual(pricing["estimated_cost_usd"], 0.445)
+        self.assertEqual(
+            [segment["prices"]["cached_input"] for segment in pricing["applied_price_segments"]],
+            [0.2, 0.1],
+        )
 
     def test_gpt_5_6_sol_promotion_updates_standard_and_fast_rates(self) -> None:
         before = "2026-09-04T04:39:28.999999Z"
@@ -1251,7 +1290,6 @@ for (const service_tier of ['default', 'standard', '']) {
             {
                 "input": 8.0,
                 "cached_input": 0.8,
-                "cache_write_input": 10.0,
                 "output": 40.0,
             },
         )
@@ -1265,7 +1303,6 @@ for (const service_tier of ['default', 'standard', '']) {
             {
                 "input": 16.0,
                 "cached_input": 1.6,
-                "cache_write_input": 20.0,
                 "output": 60.0,
             },
         )
@@ -1600,15 +1637,15 @@ for (const service_tier of ['default', 'standard', '']) {
         self.assertEqual(detail["models"], ["gpt-5.4", "gpt-5.6-sol"])
         self.assertEqual(before["models"], ["gpt-5.4"])
         self.assertEqual(after["models"], ["gpt-5.6-sol"])
-        self.assertEqual(detail["estimated_cost_usd"], 86.0)
-        self.assertEqual(detail["estimated_cost_breakdown_usd"]["input_tokens"], 12.5)
+        self.assertEqual(detail["estimated_cost_usd"], 83.5)
+        self.assertEqual(detail["estimated_cost_breakdown_usd"]["input_tokens"], 22.5)
         self.assertEqual(detail["estimated_cost_breakdown_usd"]["cached_input_tokens"], 1.0)
-        self.assertEqual(detail["estimated_cost_breakdown_usd"]["cache_write_tokens"], 12.5)
+        self.assertEqual(detail["estimated_cost_breakdown_usd"]["cache_write_tokens"], 0.0)
         self.assertEqual(detail["estimated_cost_breakdown_usd"]["output_tokens"], 60.0)
         self.assertEqual([row["model"] for row in detail["applied_price_segments"]], ["gpt-5.4", "gpt-5.6-sol"])
         self.assertEqual([row["context_tier"] for row in detail["applied_price_segments"]], [None, "long"])
         self.assertEqual(before["estimated_cost_usd"], 17.5)
-        self.assertEqual(after["estimated_cost_usd"], 68.5)
+        self.assertEqual(after["estimated_cost_usd"], 66.0)
         self.assertEqual(detail["estimated_cost_usd"], before["estimated_cost_usd"] + after["estimated_cost_usd"])
 
     def test_thread_settings_applied_updates_model_without_turn_context(self) -> None:
@@ -3600,6 +3637,10 @@ for (const service_tier of ['default', 'standard', '']) {
         try:
             opener.urlopen = lambda *_args, **_kwargs: Response(dashboard.DASHBOARD_FEATURES)
             self.assertEqual(opener.health_dashboard_url(8765), "http://127.0.0.1:8765/")
+            opener.urlopen = lambda *_args, **_kwargs: Response(
+                [feature for feature in dashboard.DASHBOARD_FEATURES if feature != "gpt-6-family-pricing-v1"]
+            )
+            self.assertIsNone(opener.health_dashboard_url(8765))
             opener.urlopen = lambda *_args, **_kwargs: Response(
                 [feature for feature in dashboard.DASHBOARD_FEATURES if feature != "effective-dated-pricing-v1"]
             )

@@ -50,6 +50,9 @@ TOKEN_KEYS = (
 FAST_MODE_SERVICE_TIERS = {"fast", "priority"}
 FAST_MODE_COST_MULTIPLIERS_BY_MODEL = {
     "gpt-6-astra": 2.0,
+    "gpt-6-sol": 2.0,
+    "gpt-6-luna": 2.0,
+    "gpt-6.1-sol": 2.0,
     "codex-auto-review": 1.0,
     "gpt-5.6": 2.0,
     "gpt-5.6-sol": 2.0,
@@ -92,49 +95,49 @@ LEGACY_MODEL_PRICES_USD_PER_M_TOKENS = {
 # 2026-07-10 01:00 in Asia/Shanghai.
 GPT_5_6_PRICING_EFFECTIVE_AT = dt.datetime(2026, 7, 9, 17, 0, 0, tzinfo=dt.UTC)
 GPT_5_6_LAUNCH_MODEL_PRICES_USD_PER_M_TOKENS = {
-    "gpt-5.6": {"input": 5.00, "cached_input": 0.50, "cache_write_input": 6.25, "output": 30.00},
-    "gpt-5.6-sol": {"input": 5.00, "cached_input": 0.50, "cache_write_input": 6.25, "output": 30.00},
-    "gpt-5.6-terra": {"input": 2.50, "cached_input": 0.25, "cache_write_input": 3.125, "output": 15.00},
-    "gpt-5.6-luna": {"input": 1.00, "cached_input": 0.10, "cache_write_input": 1.25, "output": 6.00},
+    "gpt-5.6": {"input": 5.00, "cached_input": 0.50, "output": 30.00},
+    "gpt-5.6-sol": {"input": 5.00, "cached_input": 0.50, "output": 30.00},
+    "gpt-5.6-terra": {"input": 2.50, "cached_input": 0.25, "output": 15.00},
+    "gpt-5.6-luna": {"input": 1.00, "cached_input": 0.10, "output": 6.00},
 }
 # OpenAI's changelog dates the Terra/Luna reduction to July 30. Use the
 # pricing Markdown's Last-Modified time as the exact boundary: 2026-07-31
 # 00:38:10 UTC (2026-07-31 08:38:10 in Asia/Shanghai).
 GPT_5_6_REPRICING_EFFECTIVE_AT = dt.datetime(2026, 7, 31, 0, 38, 10, tzinfo=dt.UTC)
 GPT_5_6_PRE_PROMOTION_MODEL_PRICES_USD_PER_M_TOKENS = {
-    "gpt-5.6": {"input": 5.00, "cached_input": 0.50, "cache_write_input": 6.25, "output": 30.00},
-    "gpt-5.6-sol": {"input": 5.00, "cached_input": 0.50, "cache_write_input": 6.25, "output": 30.00},
-    "gpt-5.6-terra": {"input": 2.00, "cached_input": 0.20, "cache_write_input": 2.50, "output": 12.00},
-    "gpt-5.6-luna": {"input": 0.20, "cached_input": 0.02, "cache_write_input": 0.25, "output": 1.20},
+    "gpt-5.6": {"input": 5.00, "cached_input": 0.50, "output": 30.00},
+    "gpt-5.6-sol": {"input": 5.00, "cached_input": 0.50, "output": 30.00},
+    "gpt-5.6-terra": {"input": 2.00, "cached_input": 0.20, "output": 12.00},
+    "gpt-5.6-luna": {"input": 0.20, "cached_input": 0.02, "output": 1.20},
 }
 # The pricing page added GPT-5.6 Sol promotional prices on 2026-09-04.
 # Use its Markdown Last-Modified timestamp as the exact boundary.
 GPT_5_6_SOL_PROMOTION_EFFECTIVE_AT = dt.datetime(2026, 9, 4, 4, 39, 29, tzinfo=dt.UTC)
 GPT_5_6_MODEL_PRICES_USD_PER_M_TOKENS = {
-    "gpt-5.6": {"input": 4.00, "cached_input": 0.40, "cache_write_input": 5.00, "output": 20.00},
-    "gpt-5.6-sol": {"input": 4.00, "cached_input": 0.40, "cache_write_input": 5.00, "output": 20.00},
-    "gpt-5.6-terra": {"input": 2.00, "cached_input": 0.20, "cache_write_input": 2.50, "output": 12.00},
-    "gpt-5.6-luna": {"input": 0.20, "cached_input": 0.02, "cache_write_input": 0.25, "output": 1.20},
+    "gpt-5.6": {"input": 4.00, "cached_input": 0.40, "output": 20.00},
+    "gpt-5.6-sol": {"input": 4.00, "cached_input": 0.40, "output": 20.00},
+    "gpt-5.6-terra": {"input": 2.00, "cached_input": 0.20, "output": 12.00},
+    "gpt-5.6-luna": {"input": 0.20, "cached_input": 0.02, "output": 1.20},
 }
 # The long-context tier applies to the full request above 272K input tokens.
 GPT_5_6_LONG_CONTEXT_INPUT_THRESHOLD = 272_000
 GPT_5_6_LAUNCH_LONG_CONTEXT_MODEL_PRICES_USD_PER_M_TOKENS = {
-    "gpt-5.6": {"input": 10.00, "cached_input": 1.00, "cache_write_input": 12.50, "output": 45.00},
-    "gpt-5.6-sol": {"input": 10.00, "cached_input": 1.00, "cache_write_input": 12.50, "output": 45.00},
-    "gpt-5.6-terra": {"input": 5.00, "cached_input": 0.50, "cache_write_input": 6.25, "output": 22.50},
-    "gpt-5.6-luna": {"input": 2.00, "cached_input": 0.20, "cache_write_input": 2.50, "output": 9.00},
+    "gpt-5.6": {"input": 10.00, "cached_input": 1.00, "output": 45.00},
+    "gpt-5.6-sol": {"input": 10.00, "cached_input": 1.00, "output": 45.00},
+    "gpt-5.6-terra": {"input": 5.00, "cached_input": 0.50, "output": 22.50},
+    "gpt-5.6-luna": {"input": 2.00, "cached_input": 0.20, "output": 9.00},
 }
 GPT_5_6_PRE_PROMOTION_LONG_CONTEXT_MODEL_PRICES_USD_PER_M_TOKENS = {
-    "gpt-5.6": {"input": 10.00, "cached_input": 1.00, "cache_write_input": 12.50, "output": 45.00},
-    "gpt-5.6-sol": {"input": 10.00, "cached_input": 1.00, "cache_write_input": 12.50, "output": 45.00},
-    "gpt-5.6-terra": {"input": 4.00, "cached_input": 0.40, "cache_write_input": 5.00, "output": 18.00},
-    "gpt-5.6-luna": {"input": 0.40, "cached_input": 0.04, "cache_write_input": 0.50, "output": 1.80},
+    "gpt-5.6": {"input": 10.00, "cached_input": 1.00, "output": 45.00},
+    "gpt-5.6-sol": {"input": 10.00, "cached_input": 1.00, "output": 45.00},
+    "gpt-5.6-terra": {"input": 4.00, "cached_input": 0.40, "output": 18.00},
+    "gpt-5.6-luna": {"input": 0.40, "cached_input": 0.04, "output": 1.80},
 }
 GPT_5_6_LONG_CONTEXT_MODEL_PRICES_USD_PER_M_TOKENS = {
-    "gpt-5.6": {"input": 8.00, "cached_input": 0.80, "cache_write_input": 10.00, "output": 30.00},
-    "gpt-5.6-sol": {"input": 8.00, "cached_input": 0.80, "cache_write_input": 10.00, "output": 30.00},
-    "gpt-5.6-terra": {"input": 4.00, "cached_input": 0.40, "cache_write_input": 5.00, "output": 18.00},
-    "gpt-5.6-luna": {"input": 0.40, "cached_input": 0.04, "cache_write_input": 0.50, "output": 1.80},
+    "gpt-5.6": {"input": 8.00, "cached_input": 0.80, "output": 30.00},
+    "gpt-5.6-sol": {"input": 8.00, "cached_input": 0.80, "output": 30.00},
+    "gpt-5.6-terra": {"input": 4.00, "cached_input": 0.40, "output": 18.00},
+    "gpt-5.6-luna": {"input": 0.40, "cached_input": 0.04, "output": 1.80},
 }
 GPT_5_6_LONG_CONTEXT_PRICE_SCHEDULES = (
     (GPT_5_6_PRICING_EFFECTIVE_AT, GPT_5_6_LAUNCH_LONG_CONTEXT_MODEL_PRICES_USD_PER_M_TOKENS),
@@ -158,17 +161,43 @@ GROK_4_5_LONG_CONTEXT_MODEL_PRICES_USD_PER_M_TOKENS = {
 GPT_6_ASTRA_PRICING_EFFECTIVE_AT = dt.datetime(2026, 9, 3, tzinfo=dt.UTC)
 # https://developers.openai.com/api/docs/models/gpt-6-astra
 GPT_6_ASTRA_MODEL_PRICES_USD_PER_M_TOKENS = {
-    "gpt-6-astra": {"input": 10.00, "cached_input": 1.00, "cache_write_input": 12.50, "output": 50.00},
+    "gpt-6-astra": {"input": 10.00, "cached_input": 1.00, "output": 50.00},
 }
 GPT_6_ASTRA_LONG_CONTEXT_INPUT_THRESHOLD = 272_000
 GPT_6_ASTRA_LONG_CONTEXT_MODEL_PRICES_USD_PER_M_TOKENS = {
-    "gpt-6-astra": {"input": 20.00, "cached_input": 2.00, "cache_write_input": 25.00, "output": 75.00},
+    "gpt-6-astra": {"input": 20.00, "cached_input": 2.00, "output": 75.00},
+}
+# Official launch dates: https://developers.openai.com/api/docs/changelog
+# No launch times are published; use the start of each launch day in UTC.
+GPT_6_SOL_LUNA_PRICING_EFFECTIVE_AT = dt.datetime(2026, 9, 22, tzinfo=dt.UTC)
+GPT_6_1_SOL_PRICING_EFFECTIVE_AT = dt.datetime(2026, 9, 29, tzinfo=dt.UTC)
+# https://developers.openai.com/api/docs/models/gpt-6-sol
+# https://developers.openai.com/api/docs/models/gpt-6-luna
+GPT_6_SOL_LUNA_MODEL_PRICES_USD_PER_M_TOKENS = {
+    "gpt-6-sol": {"input": 2.00, "cached_input": 0.20, "output": 10.00},
+    "gpt-6-luna": {"input": 0.10, "cached_input": 0.01, "output": 0.50},
+}
+# https://developers.openai.com/api/docs/models/gpt-6.1-sol
+GPT_6_1_SOL_MODEL_PRICES_USD_PER_M_TOKENS = {
+    "gpt-6.1-sol": {"input": 2.00, "cached_input": 0.10, "output": 10.00},
+}
+GPT_6_MODEL_PRICES_USD_PER_M_TOKENS = {
+    **GPT_6_ASTRA_MODEL_PRICES_USD_PER_M_TOKENS,
+    **GPT_6_SOL_LUNA_MODEL_PRICES_USD_PER_M_TOKENS,
+    **GPT_6_1_SOL_MODEL_PRICES_USD_PER_M_TOKENS,
+}
+GPT_6_LONG_CONTEXT_INPUT_THRESHOLD = 272_000
+GPT_6_LONG_CONTEXT_MODEL_PRICES_USD_PER_M_TOKENS = {
+    **GPT_6_ASTRA_LONG_CONTEXT_MODEL_PRICES_USD_PER_M_TOKENS,
+    "gpt-6-sol": {"input": 4.00, "cached_input": 0.40, "output": 15.00},
+    "gpt-6-luna": {"input": 0.20, "cached_input": 0.02, "output": 0.75},
+    "gpt-6.1-sol": {"input": 4.00, "cached_input": 0.20, "output": 15.00},
 }
 MODEL_PRICES_USD_PER_M_TOKENS = {
     **ZERO_COST_MODEL_PRICES_USD_PER_M_TOKENS,
     **LEGACY_MODEL_PRICES_USD_PER_M_TOKENS,
     **GPT_5_6_MODEL_PRICES_USD_PER_M_TOKENS,
-    **GPT_6_ASTRA_MODEL_PRICES_USD_PER_M_TOKENS,
+    **GPT_6_MODEL_PRICES_USD_PER_M_TOKENS,
     **GROK_4_5_MODEL_PRICES_USD_PER_M_TOKENS,
 }
 GPT_5_6_LAUNCH_PRICES_USD_PER_M_TOKENS = {
@@ -201,14 +230,35 @@ MODEL_PRICE_SCHEDULES = (
             **GPT_6_ASTRA_MODEL_PRICES_USD_PER_M_TOKENS,
         },
     ),
-    (GPT_5_6_SOL_PROMOTION_EFFECTIVE_AT, MODEL_PRICES_USD_PER_M_TOKENS),
+    (
+        GPT_5_6_SOL_PROMOTION_EFFECTIVE_AT,
+        {
+            **ZERO_COST_MODEL_PRICES_USD_PER_M_TOKENS,
+            **LEGACY_MODEL_PRICES_USD_PER_M_TOKENS,
+            **GPT_5_6_MODEL_PRICES_USD_PER_M_TOKENS,
+            **GPT_6_ASTRA_MODEL_PRICES_USD_PER_M_TOKENS,
+            **GROK_4_5_MODEL_PRICES_USD_PER_M_TOKENS,
+        },
+    ),
+    (
+        GPT_6_SOL_LUNA_PRICING_EFFECTIVE_AT,
+        {
+            **ZERO_COST_MODEL_PRICES_USD_PER_M_TOKENS,
+            **LEGACY_MODEL_PRICES_USD_PER_M_TOKENS,
+            **GPT_5_6_MODEL_PRICES_USD_PER_M_TOKENS,
+            **GPT_6_ASTRA_MODEL_PRICES_USD_PER_M_TOKENS,
+            **GPT_6_SOL_LUNA_MODEL_PRICES_USD_PER_M_TOKENS,
+            **GROK_4_5_MODEL_PRICES_USD_PER_M_TOKENS,
+        },
+    ),
+    (GPT_6_1_SOL_PRICING_EFFECTIVE_AT, MODEL_PRICES_USD_PER_M_TOKENS),
 )
 
 PERIOD_KEYS = {"today", "7d", "30d", "week", "month", "all"}
 APP_NAME = "cousash"
 SNAPSHOT_SCHEMA = "cousash.remote-snapshot"
 SNAPSHOT_VERSION = 1
-PARSE_CACHE_VERSION = 6
+PARSE_CACHE_VERSION = 7
 COMPONENT_CACHE_VERSION = 1
 PARSE_CACHE_SAMPLE_BYTES = 4096
 DEFAULT_PARSE_WORKERS = min(4, max(1, os.cpu_count() or 2))
@@ -250,6 +300,7 @@ DASHBOARD_FEATURES = [
     "session-inventory-cache-v1",
     "effective-dated-pricing-v1",
     "gpt-6-astra-pricing-v1",
+    "gpt-6-family-pricing-v1",
     "runtime-log-service-tier-v1",
     "latest-service-tier-badge-v2",
     "bounded-period-scan-v1",
@@ -734,10 +785,10 @@ def price_entry_for_model(
                     GPT_5_6_LONG_CONTEXT_PRICE_SCHEDULES,
                 )
                 context_tier = "long"
-    elif canonical_model in GPT_6_ASTRA_MODEL_PRICES_USD_PER_M_TOKENS:
+    elif canonical_model in GPT_6_MODEL_PRICES_USD_PER_M_TOKENS:
         context_tier = "short"
-        if input_tokens is not None and input_tokens > GPT_6_ASTRA_LONG_CONTEXT_INPUT_THRESHOLD:
-            prices = GPT_6_ASTRA_LONG_CONTEXT_MODEL_PRICES_USD_PER_M_TOKENS[canonical_model]
+        if input_tokens is not None and input_tokens > GPT_6_LONG_CONTEXT_INPUT_THRESHOLD:
+            prices = GPT_6_LONG_CONTEXT_MODEL_PRICES_USD_PER_M_TOKENS[canonical_model]
             context_tier = "long"
     elif canonical_model in GROK_4_5_MODEL_PRICES_USD_PER_M_TOKENS:
         context_tier = "short"
@@ -780,18 +831,15 @@ def price_for_model(
 def usage_cost_parts(usage: dict[str, int], price: dict[str, float]) -> dict[str, float] | None:
     input_tokens = max(int(usage.get("input_tokens", 0)), 0)
     cached_tokens = min(max(int(usage.get("cached_input_tokens", 0)), 0), input_tokens)
-    cache_write_tokens = min(
-        max(int(usage.get("cache_write_tokens", usage.get("cache_write_input_tokens", 0))), 0),
-        input_tokens - cached_tokens,
-    )
-    uncached_tokens = input_tokens - cached_tokens - cache_write_tokens
+    # Cache-write counts are kept for display only. Local Codex logs almost
+    # never populate them, so they are billed as ordinary uncached input.
+    uncached_tokens = input_tokens - cached_tokens
     output_tokens = max(int(usage.get("output_tokens", 0)), 0)
     reasoning_tokens = min(max(int(usage.get("reasoning_output_tokens", 0)), 0), output_tokens)
-    cache_write_price = price.get("cache_write_input", price["input"])
     return {
         "input_tokens": uncached_tokens * price["input"] / 1_000_000,
         "cached_input_tokens": cached_tokens * price["cached_input"] / 1_000_000,
-        "cache_write_tokens": cache_write_tokens * cache_write_price / 1_000_000,
+        "cache_write_tokens": 0.0,
         "output_tokens": output_tokens * price["output"] / 1_000_000,
         "reasoning_output_tokens": reasoning_tokens * price["output"] / 1_000_000,
     }
@@ -8120,14 +8168,13 @@ HTML = r"""<!doctype html>
       const taskSummary = taskGroup && taskGroup.root.uid === detail.uid && taskGroup.subagentCount
         ? taskGroup.displayRow
         : null;
-      const cacheWriteTokens = Math.max(0, Number(usage.cache_write_tokens || 0));
       const uncachedInputTokens = Math.max(
         0,
-        Number(usage.input_tokens || 0) - Number(usage.cached_input_tokens || 0) - cacheWriteTokens,
+        Number(usage.input_tokens || 0) - Number(usage.cached_input_tokens || 0),
       );
       const costs = detail.estimated_cost_breakdown_usd || {};
       const priceSegments = Array.isArray(detail.applied_price_segments) ? detail.applied_price_segments : [];
-      const max = Math.max(1, uncachedInputTokens, usage.cached_input_tokens || 0, cacheWriteTokens, usage.output_tokens || 0, usage.reasoning_output_tokens || 0);
+      const max = Math.max(1, uncachedInputTokens, usage.cached_input_tokens || 0, usage.output_tokens || 0, usage.reasoning_output_tokens || 0);
       const toolRows = Object.entries(detail.tool_counts || {}).slice(0, 8).map(([name, count]) =>
         `<tr><td>${escapeHtml(name)}</td><td class="number">${fmt(count)}</td></tr>`
       ).join('');
@@ -8168,7 +8215,6 @@ HTML = r"""<!doctype html>
         <div class="breakdown">
           ${breakdownRow(t('input'), 'input', uncachedInputTokens, max, costs.input_tokens, unitPriceTooltip(priceSegments, 'input_tokens'))}
           ${breakdownRow(t('cached'), 'cached', usage.cached_input_tokens, max, costs.cached_input_tokens, unitPriceTooltip(priceSegments, 'cached_input_tokens'))}
-          ${cacheWriteTokens ? breakdownRow(t('cacheWrite'), 'cache-write', cacheWriteTokens, max, costs.cache_write_tokens, unitPriceTooltip(priceSegments, 'cache_write_tokens')) : ''}
           ${breakdownRow(t('output'), 'output', usage.output_tokens, max, costs.output_tokens, unitPriceTooltip(priceSegments, 'output_tokens'))}
           ${breakdownRow(t('reasoning'), 'reasoning', usage.reasoning_output_tokens, max, costs.reasoning_output_tokens, unitPriceTooltip(priceSegments, 'reasoning_output_tokens', t('reasoningCostTitle')))}
         </div>
@@ -8217,7 +8263,7 @@ HTML = r"""<!doctype html>
     function segmentTokenCount(segment, usageKey) {
       const usage = segment && segment.usage ? segment.usage : {};
       if (usageKey === 'input_tokens') {
-        return Math.max(0, Number(usage.input_tokens || 0) - Number(usage.cached_input_tokens || 0) - Number(usage.cache_write_tokens || 0));
+        return Math.max(0, Number(usage.input_tokens || 0) - Number(usage.cached_input_tokens || 0));
       }
       return Math.max(0, Number(usage[usageKey] || 0));
     }
