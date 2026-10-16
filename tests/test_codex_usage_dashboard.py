@@ -3092,6 +3092,28 @@ for (const service_tier of ['default', 'standard', '']) {
             self.assertIn(old_path, parsed_paths)
             self.assertTrue(all_time["daily_usage_complete"])
 
+    def test_bounded_period_includes_recent_events_when_file_mtime_is_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir) / ".codex"
+            _key, period_start, _period_end, _start_key, _end_key = dashboard.local_period_bounds("today")
+            assert period_start is not None
+            old_timestamp = dashboard.utc_iso(period_start - dt.timedelta(days=1))
+            current_timestamp = dashboard.utc_iso(dt.datetime.now(dt.UTC))
+            path = self.write_rollout_rows(
+                codex_home,
+                "stale-mtime",
+                [
+                    {"timestamp": old_timestamp, "type": "session_meta", "payload": {"id": "stale-mtime"}},
+                    self.total_only_token_event(old_timestamp, 100, 100),
+                    self.total_only_token_event(current_timestamp, 300, 200),
+                ],
+            )
+            stale_mtime = period_start.timestamp() - 1
+            os.utime(path, (stale_mtime, stale_mtime))
+
+            analyzer = dashboard.CodexUsageAnalyzer(codex_home)
+            self.assertEqual(analyzer.scan("today")["summary"]["usage"]["total_tokens"], 200)
+
     def test_windows_cwd_uses_folder_name_for_project(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             codex_home = Path(temp_dir) / ".codex"

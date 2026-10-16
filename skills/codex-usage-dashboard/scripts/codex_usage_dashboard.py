@@ -266,6 +266,8 @@ DEFAULT_PARSE_MIN_FILES = 8
 DEFAULT_PARSE_MIN_BYTES = 256 * 1024 * 1024
 HISTORICAL_FILE_REFRESH_SECONDS = 2.0
 ACTIVE_FILE_AGE_SECONDS = 24 * 60 * 60
+ROLLOUT_TIMESTAMP_TAIL_BYTES = 64 * 1024
+ROLLOUT_TIMESTAMP_PREFIX = re.compile(rb'^\s*\{"timestamp"\s*:\s*"([^"]+)"')
 
 
 def environment_int(name: str, default: int) -> int:
@@ -304,6 +306,7 @@ DASHBOARD_FEATURES = [
     "runtime-log-service-tier-v1",
     "latest-service-tier-badge-v2",
     "bounded-period-scan-v1",
+    "rollout-tail-timestamp-period-scan-v1",
     "fork-aware-subagent-usage-v1",
     "expandable-agent-task-rollups-v1",
     "compact-agent-task-tree-v1",
@@ -1667,6 +1670,25 @@ def first_session_meta_payload(path: Path) -> dict[str, Any]:
     return {}
 
 
+def last_rollout_timestamp(path: Path, size: int) -> dt.datetime | None:
+    """Read the last event time without parsing a potentially large rollout."""
+    try:
+        with path.open("rb") as handle:
+            handle.seek(max(0, size - ROLLOUT_TIMESTAMP_TAIL_BYTES))
+            tail = handle.read(ROLLOUT_TIMESTAMP_TAIL_BYTES)
+    except OSError:
+        return None
+    lines = tail.splitlines()
+    if not lines:
+        return None
+    # If the tail starts inside a large JSON row, its first line is incomplete.
+    last_line = next((line for line in reversed(lines) if line.strip()), b"")
+    match = ROLLOUT_TIMESTAMP_PREFIX.match(last_line)
+    if match is None:
+        return None
+    return parse_timestamp(match.group(1).decode("utf-8", errors="replace"))
+
+
 class CodexLogSource(NamedTuple):
     id: str
     label: str
@@ -2638,6 +2660,7 @@ class CodexUsageAnalyzer:
         ] = {}
         self._project_info_cache: dict[str, ProjectInfo] = {}
         self._session_meta_cache: dict[str, tuple[tuple[int, ...], dict[str, Any]]] = {}
+        self._last_timestamp_cache: dict[str, tuple[tuple[int, ...], dt.datetime | None]] = {}
         self._directory_cache: dict[
             Path, tuple[tuple[int, ...], list[Path], list[Path]],
         ] = {}
@@ -2882,6 +2905,7 @@ class CodexUsageAnalyzer:
             if path not in self._scan_file_stats:
                 self._inventory_stats.pop(path, None)
                 self._session_meta_cache.pop(str(path), None)
+                self._last_timestamp_cache.pop(str(path), None)
         files.sort(key=lambda item: self._scan_file_stats[item[1]].st_mtime_ns, reverse=True)
         return files
 
@@ -2980,7 +3004,21 @@ class CodexUsageAnalyzer:
         candidates: list[tuple[CodexLogSource, Path, str]] = []
         for item in files:
             try:
-                if self.session_file_stat(item[1]).st_mtime_ns >= cutoff_ns:
+                path = item[1]
+                stat = self.session_file_stat(path)
+                if stat.st_mtime_ns >= cutoff_ns:
+                    candidates.append(item)
+                    continue
+                path_key = str(path)
+                signature = (*file_stat_tuple(stat), stat.st_ctime_ns)
+                cached = self._last_timestamp_cache.get(path_key)
+                if cached is not None and cached[0] == signature:
+                    last_timestamp = cached[1]
+                else:
+                    last_timestamp = last_rollout_timestamp(path, stat.st_size)
+                    self._last_timestamp_cache[path_key] = (signature, last_timestamp)
+                # An unknown timestamp is kept so this optimization cannot hide usage.
+                if last_timestamp is None or last_timestamp >= start_at:
                     candidates.append(item)
             except OSError:
                 continue
