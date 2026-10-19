@@ -15,6 +15,12 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 
+# Hosted Windows runners can expose TEMP through an 8.3 alias. The application
+# canonicalizes source paths; create fixtures under the same canonical root.
+# This affects only this test process, without weakening any path assertions.
+tempfile.tempdir = str(Path(tempfile.gettempdir()).resolve())
+
+
 MODULE_PATH = (
     Path(__file__).resolve().parents[1]
     / "skills"
