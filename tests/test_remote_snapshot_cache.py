@@ -90,7 +90,7 @@ class RemoteSnapshotCacheTests(unittest.TestCase):
     @staticmethod
     def write_external_snapshot(path: Path, payload: dict) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8", newline="\n")
 
     @staticmethod
     def reprice_calls_at_timestamp(mock, timestamp: str) -> int:
@@ -361,7 +361,7 @@ class RemoteSnapshotCacheTests(unittest.TestCase):
             store = dashboard.RemoteSnapshotStore("local-device", root / "remotes")
             path = store.snapshot_path("remote-device")
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text("{corrupted", encoding="utf-8")
+            path.write_text("{corrupted", encoding="utf-8", newline="\n")
             analyzer = dashboard.CodexUsageAnalyzer(
                 root / "local" / ".codex",
                 remote_store=store,

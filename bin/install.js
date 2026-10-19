@@ -77,7 +77,7 @@ console.log("Restart Codex or open a new Codex conversation, then ask:");
 console.log("  Use $codex-usage-dashboard to open my Codex usage dashboard");
 console.log("");
 console.log("Standard skills CLI install:");
-console.log("  npx skills add luyh7/codex-usage-dashboard -g -a codex -y");
+console.log("  npx skills add fishchipssss/codex-usage-dashboard -g -a codex -y");
 console.log("");
 console.log("Direct launch:");
 console.log(`  python "${path.join(targetSkill, "scripts", "open_dashboard.py")}"`);

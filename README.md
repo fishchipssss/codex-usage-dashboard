@@ -1,11 +1,27 @@
-# Codex Usage Dashboard
+# Codex Usage Dashboard — Community Edition
+
+
+Independent community fork of [luyh7/codex-usage-dashboard](https://github.com/luyh7/codex-usage-dashboard), licensed under MIT. This repository contains application code and synthetic tests only. It does not include personal sessions, source configurations, databases, authentication files or recovery archives.
+
+## What This Fork Adds
+
+- Persistent configuration for multiple local Codex homes, including backup/profile homes and source health/provenance.
+- Explicit same-origin cross-source deduplication and continuation reconciliation. Different devices are not merged automatically.
+- Lossless Windows filesystem identity storage in SQLite caches, with graceful fallback on cache failure.
+- Event-level model attribution and token conservation, preserving cached-input and reasoning-output subset semantics.
+- A refined light/dark dashboard with a focused usage overview, dense aligned tables, keyboard interaction, source disclosures and responsive layouts.
+- An optional experimental read-only native-history projection exporter. It exports partial content only, never manufactures rollout events and never contributes native metadata counters to dashboard usage.
+
+The screenshot below uses **synthetic demo sessions**. API-equivalent estimates are not subscription charges. Missing rollout data cannot be reconstructed into exact token accounting from native metadata alone.
+
+See [configuration and accounting](docs/CONFIGURATION.md), [privacy](PRIVACY.md), [validation](docs/VALIDATION.md) and [upstream acknowledgements](#acknowledgements).
 
 Codex-only skill for a local OpenAI Codex usage dashboard.
 
 It reads your local Codex session logs and opens a browser dashboard for per-conversation usage: total tokens, output tokens, estimated dollar cost, cache hit rate, turns, model, reasoning effort, tool calls, and token-count timeline. It can also import JSON snapshots exported from other devices, so each machine can show local realtime usage plus manually imported remote usage.
 
 > Currently only supports OpenAI Codex. It is not a Claude Code, Cursor, Continue, or generic OpenAI API dashboard.
-<img width="1830" height="1041" alt="Codex Usage Dashboard project view" src="assets/codex-usage-dashboard.png" />
+<img width="1440" height="1000" alt="Codex Usage Dashboard project view" src="assets/community-dashboard.png" />
 
 ## Why This Exists
 
@@ -20,7 +36,7 @@ It shows a searchable conversation list and a detail view for each session, incl
 Recommended global Codex install:
 
 ```bash
-npx skills add luyh7/codex-usage-dashboard -g -a codex -y
+npx skills add fishchipssss/codex-usage-dashboard -g -a codex -y
 ```
 
 Then restart Codex or open a new Codex conversation. Type `/usage`, then select the **Codex Usage Dashboard** skill.
@@ -32,19 +48,19 @@ The skill opens the local dashboard in your browser.
 GitHub installer:
 
 ```bash
-npx github:luyh7/codex-usage-dashboard
+npx github:fishchipssss/codex-usage-dashboard
 ```
 
 Install and create a desktop shortcut:
 
 ```bash
-npx github:luyh7/codex-usage-dashboard -- --shortcut
+npx github:fishchipssss/codex-usage-dashboard -- --shortcut
 ```
 
 Install and open immediately:
 
 ```bash
-npx github:luyh7/codex-usage-dashboard -- --open
+npx github:fishchipssss/codex-usage-dashboard -- --open
 ```
 
 ## Features
@@ -175,3 +191,22 @@ This is a local dashboard. It does not upload your Codex logs. It starts a local
 ## Keywords
 
 OpenAI Codex usage dashboard, Codex token usage, Codex per conversation usage, Codex session usage, Codex output tokens, Codex cache hit rate, Codex cost estimate, Codex local logs, Codex skill, OpenAI Codex skill.
+
+## Development
+
+Python 3.10+ and Node.js 18+ are required. No Python packages or external font/chart services are needed.
+
+```bash
+python -B -m unittest discover -s tests -v
+node --check bin/install.js
+```
+
+On Windows, enable UTF-8 for development commands (`$env:PYTHONUTF8='1'` in PowerShell). Use only synthetic data for tests, screenshots and issue reproductions. Never attach a real snapshot or session database to an issue.
+
+## Acknowledgements
+
+This project is based on [Codex Usage Dashboard](https://github.com/luyh7/codex-usage-dashboard), originally developed by [luyh7](https://github.com/luyh7) and distributed under the MIT License.
+
+This modified version adds historical multi-profile aggregation, cross-source deduplication, improved token/model accounting, Windows SQLite cache compatibility fixes and a redesigned dashboard interface. The original copyright and MIT license text are preserved without replacement.
+
+This is an independent community-maintained modification. It is not officially affiliated with or endorsed by the original author or OpenAI. No code, assets or templates from design-skill repositories are redistributed here; the interface uses system fonts and the project's existing local assets.

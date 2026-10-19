@@ -278,6 +278,7 @@ def environment_int(name: str, default: int) -> int:
 
 
 DASHBOARD_FEATURES = [
+    "history-recovery-repair-v1",
     "periods",
     "period-deltas",
     "period-token-label",
@@ -333,6 +334,7 @@ DASHBOARD_FEATURES = [
 ]
 
 SUMMARY_KEYS = (
+    "provenance", "deduplication", "counter_resets", "model_usage", "model_attribution",
     "uid",
     "session_id",
     "root_session_id",
@@ -2320,6 +2322,59 @@ class LocalComponentCacheEntry(NamedTuple):
     daily_usage: list[dict[str, Any]] | None
 
 
+
+def sqlite_fs_identity(value: int) -> int | str:
+    """Tagged decimal TEXT bypasses SQLite INTEGER affinity without losing any bits.
+
+    Ordinary signed 64-bit records remain unchanged and backward-compatible.
+    A nonnumeric tag is essential: bare decimal TEXT can be coerced to REAL.
+    """
+    value = int(value)
+    return value if -(1 << 63) <= value < (1 << 63) else f"fsid:{value}"
+
+
+def decode_fs_identity(value: Any) -> int:
+    if isinstance(value, float):
+        raise ValueError("Lossy filesystem identity in cache")
+    if isinstance(value, str) and value.startswith("fsid:"):
+        return int(value[5:])
+    return int(value)
+
+
+def source_configuration(path: Path | None = None) -> tuple[list[CodexLogSource], dict[str, str]]:
+    """Only explicit user configuration may equate local origins. Never infer devices."""
+    config = read_json_file(path or app_config_dir() / "sources.json")
+    if not config:
+        return [], {}
+    if config.get("version") != 1 or not isinstance(config.get("sources"), list):
+        raise ValueError("Unsupported Dashboard sources.json; expected version 1 and sources list")
+    sources, origins = [], {}
+    for row in config["sources"]:
+        if not isinstance(row, dict) or not isinstance(row.get("codex_home"), str):
+            raise ValueError("Each Dashboard source must have a codex_home path")
+        home = Path(row["codex_home"]).expanduser().resolve()
+        source = make_log_source(home, row.get("label"), row.get("id"))
+        sources.append(source)
+        origin = row.get("origin_id")
+        if origin is not None:
+            if not isinstance(origin, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,100}", origin):
+                raise ValueError("Invalid origin_id in Dashboard source configuration")
+            origins[os.path.normcase(str(home))] = origin
+    return dedupe_codex_sources(sources), origins
+
+
+def attach_model_usage(detail: dict[str, Any]) -> None:
+    """Use the model recorded at each event, never the conversation's final model."""
+    by_model: dict[str, dict[str, int]] = {}
+    for row, _time, _cumulative, delta in timeline_rows_with_deltas(detail.get("timeline", [])):
+        model = str(row.get("model") or "unknown")
+        by_model[model] = add_usage(by_model.get(model, zero_usage()), delta)
+    if not by_model and usage_has_tokens(normalize_usage(detail.get("total_token_usage"))):
+        by_model["unknown"] = normalize_usage(detail.get("total_token_usage"))
+    detail["model_usage"] = by_model
+    detail["model_attribution"] = "recorded-event-context" if by_model and "unknown" not in by_model else "unknown-or-partial"
+
+
 class PersistentParseCache:
     def __init__(self, path: Path | None = None):
         self.path = path or parse_cache_path()
@@ -2407,8 +2462,8 @@ class PersistentParseCache:
                 return FileParseCacheEntry(
                     int(row[0]),
                     int(row[1]),
-                    int(row[2]),
-                    int(row[3]),
+                    decode_fs_identity(row[2]),
+                    decode_fs_identity(row[3]),
                     self.decode_payload(row[7]),
                     self.decode_payload(row[8]),
                     bool(row[4]),
@@ -2453,8 +2508,8 @@ class PersistentParseCache:
                     PARSE_CACHE_VERSION,
                     entry.mtime_ns,
                     entry.size,
-                    entry.device,
-                    entry.inode,
+                    sqlite_fs_identity(entry.device),
+                    sqlite_fs_identity(entry.inode),
                     int(entry.append_safe),
                     entry.prefix_digest,
                     entry.tail_digest,
@@ -2490,7 +2545,7 @@ class PersistentParseCache:
                     rows,
                 )
                 connection.commit()
-            except (OSError, sqlite3.Error, TypeError, ValueError):
+            except (OSError, sqlite3.Error, TypeError, ValueError, OverflowError):
                 try:
                     connection.rollback()
                 except sqlite3.Error:
@@ -2620,6 +2675,7 @@ class CodexUsageAnalyzer:
         resolve_project_info: bool = True,
         parallel_workers: int = 0,
         inventory_refresh_seconds: float | None = None,
+        source_origins: dict[str, str] | None = None,
     ):
         if isinstance(codex_home, list):
             if codex_home and isinstance(codex_home[0], CodexLogSource):
@@ -2631,6 +2687,7 @@ class CodexUsageAnalyzer:
         if not sources:
             sources = codex_sources_from_homes([Path.home() / ".codex"])
         self.codex_sources = sources
+        self.source_origins = {os.path.normcase(str(Path(k).resolve())): v for k, v in (source_origins or {}).items()}
         self.codex_home = sources[0].codex_home
         self.codex_home_display = codex_home_display(sources)
         self.remote_store = remote_store
@@ -2696,6 +2753,9 @@ class CodexUsageAnalyzer:
         self._published_lock = threading.Lock()
         self._published_snapshots: dict[str, dict[str, Any]] = {}
         self._session_payload_cache: dict[str, bytes] = {}
+
+    def local_origin(self, source: CodexLogSource) -> str:
+        return self.source_origins.get(os.path.normcase(str(source.codex_home)), source.id)
 
     def publish_snapshot(
         self,
@@ -2847,7 +2907,8 @@ class CodexUsageAnalyzer:
                         directories.append(path)
                     elif path.match("*.jsonl"):
                         try:
-                            file_stat = entry.stat()
+                            # Windows DirEntry.stat() may report zero device/inode.
+                            file_stat = path.stat() if os.name == "nt" else entry.stat()
                         except OSError:
                             continue
                         files.append(path)
@@ -3043,7 +3104,7 @@ class CodexUsageAnalyzer:
                 self._metadata_by_path[path_key] = payload
                 session_id = payload.get("id") or payload.get("session_id")
                 if isinstance(session_id, str) and session_id:
-                    self._files_by_thread.setdefault((log_source.id, session_id), []).append(item)
+                    self._files_by_thread.setdefault((self.local_origin(log_source), session_id), []).append(item)
             self._dependency_index_signature = signature
         metadata_by_path = self._metadata_by_path
         files_by_thread = self._files_by_thread
@@ -3055,7 +3116,7 @@ class CodexUsageAnalyzer:
             payload = metadata_by_path.get(self.resolved_path_key(path), {})
             session_id = payload.get("id") or payload.get("session_id")
             if isinstance(session_id, str) and session_id:
-                for sibling in files_by_thread.get((log_source.id, session_id), []):
+                for sibling in files_by_thread.get((self.local_origin(log_source), session_id), []):
                     sibling_key = self.resolved_path_key(sibling[1])
                     if sibling_key in selected:
                         continue
@@ -3065,7 +3126,7 @@ class CodexUsageAnalyzer:
             forked_from_id = payload.get("forked_from_id")
             if not isinstance(forked_from_id, str) or not forked_from_id:
                 continue
-            for dependency in files_by_thread.get((log_source.id, forked_from_id), []):
+            for dependency in files_by_thread.get((self.local_origin(log_source), forked_from_id), []):
                 dependency_key = self.resolved_path_key(dependency[1])
                 if dependency_key in selected:
                     continue
@@ -3142,9 +3203,11 @@ class CodexUsageAnalyzer:
             merged = dict(first_detail)
 
             timeline_items: list[tuple[dt.datetime, int, dict[str, Any]]] = []
-            seen_timeline: set[tuple[Any, ...]] = set()
+            seen_timeline: dict[tuple[Any, ...], int] = {}
+            duplicate_observations = 0
             sequence = 0
             for detail in details:
+                observations: dict[tuple[Any, ...], int] = {}
                 timeline = detail.get("timeline")
                 if not isinstance(timeline, list):
                     continue
@@ -3157,10 +3220,20 @@ class CodexUsageAnalyzer:
                         str(row.get("model") or ""),
                         str(row.get("service_tier") or ""),
                         timeline_usage_fingerprint(row),
+                        str(row.get("event_id") or ""),
+                        str(row.get("turn_id") or ""),
                     )
-                    if fingerprint in seen_timeline:
+                    # Preserve repeated legitimate events within one fragment. Across
+                    # copies, keep maximum observed multiplicity, not a global set.
+                    # Without chronology or an event ID, equivalence is unproven.
+                    if timestamp is None and not row.get("event_id"):
+                        fingerprint += (str(detail.get("path") or id(detail)), sequence)
+                    occurrence = 1 if row.get("event_id") else observations.get(fingerprint, 0) + 1
+                    observations[fingerprint] = occurrence
+                    if occurrence <= seen_timeline.get(fingerprint, 0):
+                        duplicate_observations += 1
                         continue
-                    seen_timeline.add(fingerprint)
+                    seen_timeline[fingerprint] = occurrence
                     timeline_items.append(
                         (
                             timestamp or dt.datetime.max.replace(tzinfo=dt.UTC),
@@ -3292,6 +3365,12 @@ class CodexUsageAnalyzer:
             ]
             if component_orders:
                 merged["_component_order"] = min(component_orders)
+            provenance = {}
+            for item in details:
+                for evidence in item.get("provenance", []):
+                    provenance[(evidence["home"], evidence["path"])] = evidence
+            merged["provenance"] = list(provenance.values())
+            merged["deduplication"] = {"fragments": len(details), "duplicate_token_observations_removed": duplicate_observations, "policy": "explicit-origin/session-id/event-fingerprint/multiplicity"}
             merged["timeline"] = timeline
             merged["_service_tier_events"] = service_tier_events
             merged["tasks"] = tasks
@@ -3390,6 +3469,11 @@ class CodexUsageAnalyzer:
                 summary.update({field: detail.get(field) for field in SUMMARY_KEYS})
                 continue
 
+            detail["counter_resets"] = [
+                {"timestamp": current.get("timestamp"), "previous_total": normalize_usage(previous.get("total_token_usage"))["total_tokens"], "current_total": normalize_usage(current.get("total_token_usage"))["total_tokens"]}
+                for previous, current in zip(timeline, timeline[1:])
+                if normalize_usage(current.get("total_token_usage"))["total_tokens"] < normalize_usage(previous.get("total_token_usage"))["total_tokens"]
+            ]
             normalized_timeline: list[dict[str, Any]] = []
             total_usage = zero_usage()
             last_usage = zero_usage()
@@ -4113,14 +4197,15 @@ class CodexUsageAnalyzer:
             )
             apply_runtime_service_tiers(detail, tier_events)
             if fragment_signature is not None:
-                fragment_signature = (*fragment_signature, tuple(
+                fragment_signature = (*fragment_signature, self.source_origins.get(os.path.normcase(str(log_source.codex_home)), log_source.id), tuple(
                     (event["timestamp"], event["service_tier"]) for event in tier_events
                 ))
             detail.update(
                 {
                     "source": source,
                     "environment": log_source.label,
-                    "environment_id": log_source.id,
+                    "environment_id": self.source_origins.get(os.path.normcase(str(log_source.codex_home)), log_source.id),
+                    "provenance": [{"home": str(log_source.codex_home), "path": str(path), "source_id": log_source.id, "kind": source, "file_size": self.session_file_stat(path).st_size}],
                     "codex_home": str(log_source.codex_home),
                     "project": project_info.project,
                     "project_root": project_info.project_root,
@@ -4130,6 +4215,9 @@ class CodexUsageAnalyzer:
                     "_component_order": index,
                 }
             )
+            if self.local_origin(log_source) != log_source.id and detail.get("session_id"):
+                # Stable across archive moves and temporary source unavailability.
+                detail["uid"] = hashlib.sha1(f"origin:{self.local_origin(log_source)}:session:{detail['session_id']}".encode("utf-8")).hexdigest()[:16]
             summary.update({key: detail.get(key) for key in SUMMARY_KEYS})
             local_fragments.append((summary, detail, fragment_signature))
 
@@ -4144,6 +4232,8 @@ class CodexUsageAnalyzer:
         )
 
         for summary, detail in local_rows:
+            attach_model_usage(detail)
+            summary.update({key: detail.get(key) for key in SUMMARY_KEYS})
             for key in tuple(detail):
                 if key.startswith("_"):
                     detail.pop(key, None)
@@ -4157,6 +4247,13 @@ class CodexUsageAnalyzer:
             details_by_uid[summary["uid"]] = detail
 
         codex_sources: list[dict[str, Any]] = codex_source_payloads(self.codex_sources)
+        seen_by_origin: dict[str, set[str]] = {}
+        for row in codex_sources:
+            origin = self.source_origins.get(os.path.normcase(row["codex_home"]), row["id"])
+            ids = {str(detail.get("session_id")) for _, detail in local_rows if any(p["home"] == row["codex_home"] for p in detail.get("provenance", []))}
+            seen = seen_by_origin.setdefault(origin, set())
+            row.update(origin_id=origin, status="available" if path_has_codex_logs(Path(row["codex_home"])) else "unavailable", files_scanned=sum(str(src.codex_home) == row["codex_home"] for src, _, _ in files), contributing_sessions=len(ids), newly_contributed_sessions=len(ids - seen), last_scanned_at=utc_iso(dt.datetime.now(dt.UTC)))
+            seen.update(ids)
         remote_daily_usage: list[dict[str, Any]] = []
         if include_remotes and self.remote_store is not None:
             remote_sessions, remote_details, remote_sources = self.remote_store.transformed_sessions()
@@ -4295,6 +4392,7 @@ class CodexUsageAnalyzer:
         ranged["timeline"] = timeline
         ranged["tasks"] = tasks
         ranged["total_token_usage"] = total_usage
+        attach_model_usage(ranged)
         ranged["last_token_usage"] = last_usage
         period_models = unique_models(timeline, detail.get("model") if not timeline else None)
         if timeline:
@@ -4720,6 +4818,8 @@ class CodexUsageAnalyzer:
                             model_context_window = int(window)
                         timeline.append(
                             {
+                                **({"event_id": str(payload.get("event_id") or info.get("event_id"))} if payload.get("event_id") or info.get("event_id") else {}),
+                                **({"turn_id": str(payload.get("turn_id") or info.get("turn_id"))} if payload.get("turn_id") or info.get("turn_id") else {}),
                                 "timestamp": timestamp,
                                 "model": model,
                                 "service_tier": service_tier,
@@ -4893,6 +4993,8 @@ class CodexUsageAnalyzer:
             "_parsed_end_offset": start_offset + rollout_stats.bytes_read,
         }
 
+        for key, default in [("provenance", []), ("deduplication", {}), ("counter_resets", []), ("model_usage", {}), ("model_attribution", "unknown-or-partial")]:
+            detail.setdefault(key, default)
         summary = {key: detail[key] for key in SUMMARY_KEYS}
         return summary, detail
 
@@ -4923,10 +5025,13 @@ class CodexUsageAnalyzer:
             elif session.get("source") == "archived":
                 archived_count += 1
 
-            model = str(session.get("model") or "unknown")
-            by_model.setdefault(model, {"model": model, "sessions": 0, "usage": zero_usage()})
-            by_model[model]["sessions"] += 1
-            by_model[model]["usage"] = add_usage(by_model[model]["usage"], usage)
+            model_usage = session.get("model_usage")
+            if not isinstance(model_usage, dict):
+                model_usage = {"unknown": usage}
+            for model, event_usage in model_usage.items():
+                by_model.setdefault(model, {"model": model, "sessions": 0, "usage": zero_usage()})
+                by_model[model]["sessions"] += 1
+                by_model[model]["usage"] = add_usage(by_model[model]["usage"], normalize_usage(event_usage))
 
             project_key = str(session.get("project_root") or session.get("project") or "unknown")
             project = str(session.get("project") or folder_name_from_path(project_key) or "unknown")
@@ -5017,1095 +5122,284 @@ HTML = r"""<!doctype html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Codex Usage Dashboard</title>
+  <meta name="theme-color" content="#f5f5f7">
   <style>
-    :root {
-      color-scheme: light;
-      --bg: #f5f7f6;
-      --panel: #ffffff;
-      --line: #d9dfdd;
-      --text: #17201d;
-      --muted: #65716c;
-      --accent: #0f7b63;
-      --accent-2: #b85f18;
-      --accent-3: #2d5fa8;
-      --project-summary: #2d5fa8;
-      --danger: #b42318;
-      --soft: #edf4f1;
-      --shadow: 0 10px 30px rgba(26, 36, 32, 0.08);
-      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      background: var(--bg);
-      color: var(--text);
-      font-size: 14px;
-    }
-    body.data-loading {
-      overflow: hidden;
-    }
-    .loading-overlay[hidden] {
-      display: none;
-    }
-    .loading-overlay {
-      position: fixed;
-      inset: 0;
-      z-index: 60;
-      display: grid;
-      place-items: center;
-      padding: 24px;
-      background: rgba(245, 247, 246, 0.82);
-      backdrop-filter: blur(2px);
-    }
-    .loading-indicator {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      min-height: 48px;
-      padding: 10px 14px;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: rgba(255, 255, 255, 0.96);
-      box-shadow: var(--shadow);
-      color: var(--text);
-      font-weight: 650;
-    }
-    .loading-spinner {
-      width: 22px;
-      height: 22px;
-      flex: 0 0 22px;
-      border: 3px solid #c8d5d0;
-      border-top-color: var(--accent);
-      border-right-color: var(--accent-2);
-      border-radius: 50%;
-      animation: loading-spin 0.75s linear infinite;
-    }
-    @keyframes loading-spin {
-      to { transform: rotate(360deg); }
-    }
-    @media (prefers-reduced-motion: reduce) {
-      .loading-spinner { animation: none; }
-    }
-    header {
-      position: sticky;
-      top: 0;
-      z-index: 5;
-      background: rgba(245, 247, 246, 0.94);
-      border-bottom: 1px solid var(--line);
-      backdrop-filter: blur(10px);
-    }
-    .header-inner {
-      max-width: 1480px;
-      margin: 0 auto;
-      padding: 18px 24px 14px;
-      display: grid;
-      grid-template-columns: minmax(220px, 1fr) auto minmax(220px, 1fr);
-      align-items: center;
-      gap: 16px;
-    }
-    .brand {
-      min-width: 0;
-    }
-    h1 {
-      margin: 0;
-      font-size: 22px;
-      line-height: 1.2;
-      letter-spacing: 0;
-    }
-    .subtitle {
-      margin-top: 4px;
-      color: var(--muted);
-      font-size: 13px;
-      word-break: break-all;
-    }
-    .toolbar {
-      display: flex;
-      gap: 8px;
-      flex-wrap: wrap;
-      justify-content: flex-end;
-      justify-self: end;
-    }
-    .period-wrap {
-      position: relative;
-      justify-self: center;
-    }
-    .period-toggle {
-      display: grid;
-      grid-template-columns: repeat(7, minmax(48px, 1fr));
-      gap: 3px;
-      min-height: 38px;
-      padding: 3px;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: #fff;
-      min-width: 458px;
-    }
-    .period-option {
-      min-height: 30px;
-      border: 0;
-      border-radius: 6px;
-      background: transparent;
-      color: var(--muted);
-      font-weight: 700;
-      padding: 0 10px;
-      white-space: nowrap;
-    }
-    .period-option.active {
-      background: var(--accent);
-      color: #fff;
-      box-shadow: 0 1px 4px rgba(15, 123, 99, 0.22);
-    }
-    .calendar-popover {
-      position: absolute;
-      top: calc(100% + 8px);
-      left: 50%;
-      transform: translateX(-50%);
-      width: 360px;
-      padding: 12px;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: #fff;
-      box-shadow: 0 18px 40px rgba(26, 36, 32, 0.18);
-      z-index: 20;
-    }
-    .calendar-popover[hidden] {
-      display: none;
-    }
-    .modal-backdrop[hidden] {
-      display: none;
-    }
-    .modal-backdrop {
-      position: fixed;
-      inset: 0;
-      z-index: 40;
-      display: grid;
-      place-items: center;
-      padding: 24px;
-      background: rgba(23, 32, 29, 0.36);
-    }
-    .modal {
-      width: min(720px, 100%);
-      max-height: min(720px, calc(100vh - 48px));
-      overflow: auto;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: #fff;
-      box-shadow: 0 20px 60px rgba(23, 32, 29, 0.22);
-    }
-    .modal-head,
-    .modal-actions {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      padding: 14px 16px;
-      border-bottom: 1px solid var(--line);
-    }
-    .modal-actions {
-      justify-content: flex-end;
-      border-top: 1px solid var(--line);
-      border-bottom: 0;
-    }
-    .modal-head h2 {
-      margin: 0;
-      font-size: 16px;
-      line-height: 1.3;
-    }
-    .modal-body {
-      padding: 16px;
-      display: grid;
-      gap: 12px;
-    }
-    .remote-table {
-      width: 100%;
-      min-width: 0;
-      table-layout: fixed;
-      font-size: 13px;
-    }
-    .remote-table th:nth-child(1) { width: 18%; }
-    .remote-table th:nth-child(2) { width: 18%; }
-    .remote-table th:nth-child(3) { width: 9%; }
-    .remote-table th:nth-child(4) { width: 15%; }
-    .remote-table th:nth-child(5) { width: 15%; }
-    .remote-table th:nth-child(6) { width: 25%; }
-    .remote-table th,
-    .remote-table td {
-      position: static;
-      padding: 8px;
-      vertical-align: middle;
-    }
-    .remote-table th {
-      text-align: left;
-    }
-    .remote-table .remote-count {
-      font-variant-numeric: tabular-nums;
-      text-align: left;
-      white-space: nowrap;
-    }
-    .remote-table .remote-date,
-    .remote-table .remote-code {
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-    .remote-table .remote-action-cell {
-      text-align: right;
-    }
-    .remote-actions {
-      display: flex;
-      gap: 6px;
-      justify-content: flex-end;
-      flex-wrap: nowrap;
-      white-space: nowrap;
-    }
-    .remote-actions button {
-      min-height: 30px;
-      padding: 0 8px;
-    }
-    .inline-form {
-      display: grid;
-      gap: 8px;
-    }
-    .inline-form label {
-      color: var(--muted);
-      font-size: 12px;
-      font-weight: 700;
-    }
-    .inline-form input {
-      width: 100%;
-      padding: 0 10px;
-    }
-    .status-line {
-      color: var(--muted);
-      font-size: 12px;
-      line-height: 1.5;
-    }
-    .status-line.error-text {
-      color: var(--danger);
-    }
-    .danger {
-      color: var(--danger);
-      border-color: #f1b4ae;
-      background: #fff7f6;
-    }
-    .calendar-head,
-    .calendar-actions {
-      display: grid;
-      grid-template-columns: 36px minmax(0, 1fr) 36px;
-      gap: 8px;
-      align-items: center;
-      margin-bottom: 10px;
-    }
-    .calendar-title {
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      min-width: 0;
-      text-align: center;
-      font-weight: 750;
-      font-size: 14px;
-    }
-    .calendar-title-button {
-      min-height: 32px;
-      padding: 0 4px;
-      border: 0;
-      background: transparent;
-      font: inherit;
-    }
-    .calendar-title-button:hover {
-      background: var(--soft);
-    }
-    .calendar-title-caret {
-      margin-left: 2px;
-      color: var(--muted);
-      font-size: 10px;
-    }
-    .calendar-actions {
-      grid-template-columns: 1fr 1fr;
-      margin: 10px 0 0;
-    }
-    .calendar-grid {
-      display: grid;
-      grid-template-columns: repeat(7, minmax(0, 1fr));
-      gap: 4px;
-    }
-    .calendar-picker-grid {
-      display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-      grid-auto-rows: 64px;
-      align-content: center;
-      gap: 6px;
-      min-height: 295px;
-    }
-    .calendar-picker-option {
-      display: grid;
-      grid-template-rows: 18px 15px;
-      align-content: center;
-      gap: 3px;
-      min-width: 0;
-      padding: 0 6px;
-      font-size: 13px;
-      font-weight: 700;
-      line-height: 1.1;
-    }
-    .calendar-picker-option.in-range {
-      border-color: #99c9bb;
-      background: #eef8f4;
-    }
-    .calendar-picker-option.selected {
-      border-color: var(--accent);
-      background: var(--accent);
-      color: #fff;
-    }
-    .calendar-picker-option:disabled {
-      color: #b8c0bd;
-      cursor: default;
-      background: #f8faf9;
-    }
-    .calendar-picker-usage {
-      display: grid;
-      place-items: center;
-      overflow: hidden;
-      color: var(--muted);
-      font-size: 10px;
-      font-weight: 500;
-      line-height: 1.2;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .calendar-picker-option.selected .calendar-picker-usage {
-      color: rgba(255, 255, 255, 0.84);
-    }
-    .calendar-picker-spinner {
-      box-sizing: border-box;
-      width: 12px;
-      height: 12px;
-      flex: none;
-      border-width: 2px;
-      border-color: rgba(99, 116, 109, 0.25);
-      border-top-color: currentColor;
-    }
-    .calendar-picker-option.selected .calendar-picker-spinner {
-      border-color: rgba(255, 255, 255, 0.3);
-      border-top-color: currentColor;
-    }
-    .calendar-day-spinner {
-      box-sizing: border-box;
-      width: 12px;
-      height: 12px;
-      justify-self: center;
-      flex: none;
-      border-width: 2px;
-      border-color: rgba(99, 116, 109, 0.25);
-      border-top-color: currentColor;
-    }
-    .calendar-day.range-edge .calendar-day-spinner {
-      border-color: rgba(255, 255, 255, 0.3);
-      border-top-color: currentColor;
-    }
-    .calendar-day-loading {
-      display: grid;
-      place-items: center;
-    }
-    .calendar-weekday {
-      color: var(--muted);
-      font-size: 11px;
-      font-weight: 700;
-      text-align: center;
-      padding: 4px 0;
-    }
-    .calendar-day {
-      display: grid;
-      grid-template-rows: 16px 14px;
-      gap: 2px;
-      min-height: 42px;
-      padding: 4px 2px;
-      border-radius: 6px;
-      font-size: 12px;
-      line-height: 1;
-      text-align: center;
-    }
-    .calendar-day.outside {
-      color: #a3aca8;
-      background: #fbfcfc;
-    }
-    .calendar-day.in-range {
-      background: #eef8f4;
-      border-color: #99c9bb;
-    }
-    .calendar-day.range-edge {
-      background: var(--accent);
-      border-color: var(--accent);
-      color: #fff;
-    }
-    .calendar-day:disabled {
-      color: #b8c0bd;
-      cursor: default;
-      background: #f8faf9;
-    }
-    .calendar-usage {
-      color: var(--muted);
-      font-size: 10px;
-      line-height: 1.2;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .calendar-day.range-edge .calendar-usage {
-      color: rgba(255, 255, 255, 0.84);
-    }
-    .lang-toggle {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 3px;
-      min-height: 36px;
-      padding: 3px;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: #fff;
-    }
-    .lang-option {
-      min-height: 28px;
-      border: 0;
-      border-radius: 6px;
-      background: transparent;
-      color: var(--muted);
-      font-weight: 700;
-      padding: 0 9px;
-    }
-    .lang-option.active {
-      background: #17201d;
-      color: #fff;
-    }
-    button, select, input {
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: #fff;
-      color: var(--text);
-      min-height: 36px;
-      font: inherit;
-    }
-    button {
-      padding: 0 12px;
-      cursor: pointer;
-    }
-    button.primary {
-      background: var(--accent);
-      border-color: var(--accent);
-      color: #fff;
-    }
-    button:hover { border-color: #9da9a4; }
-    main {
-      max-width: 1480px;
-      margin: 0 auto;
-      padding: 20px 24px 28px;
-    }
-    .metrics {
-      display: grid;
-      grid-template-columns: repeat(6, minmax(130px, 1fr));
-      gap: 12px;
-      margin-bottom: 16px;
-    }
-    .metric {
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 14px;
-      box-shadow: var(--shadow);
-      min-width: 0;
-    }
-    .metric .label {
-      color: var(--muted);
-      font-size: 12px;
-      margin-bottom: 6px;
-      white-space: nowrap;
-    }
-    .metric .value {
-      font-size: 22px;
-      font-weight: 700;
-      line-height: 1.1;
-      overflow-wrap: anywhere;
-    }
-    .metric .hint {
-      color: var(--muted);
-      font-size: 12px;
-      margin-top: 5px;
-      min-height: 16px;
-      overflow-wrap: anywhere;
-    }
-    .controls {
-      display: grid;
-      grid-template-columns: minmax(220px, 1fr) 140px 150px 170px 210px 130px;
-      gap: 10px;
-      margin-bottom: 16px;
-    }
-    input, select {
-      width: 100%;
-      padding: 0 10px;
-    }
-    .sort-toggle {
-      display: grid;
-      grid-template-columns: 1fr 1fr 1fr;
-      gap: 4px;
-      min-height: 36px;
-      padding: 3px;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: #fff;
-    }
-    .sort-option {
-      min-height: 28px;
-      border: 0;
-      border-radius: 6px;
-      background: transparent;
-      color: var(--muted);
-      font-weight: 700;
-      padding: 0 10px;
-    }
-    .sort-option.active {
-      background: var(--accent);
-      color: #fff;
-      box-shadow: 0 1px 4px rgba(15, 123, 99, 0.22);
-    }
-    .layout {
-      display: grid;
-      grid-template-columns: minmax(0, 1.8fr) minmax(360px, 0.9fr);
-      gap: 16px;
-      align-items: start;
-    }
-    section, aside {
-      min-width: 0;
-    }
-    .panel {
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      box-shadow: var(--shadow);
-    }
-    .panel-title {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      padding: 14px 14px 10px;
-      border-bottom: 1px solid var(--line);
-    }
-    .panel-title h2 {
-      margin: 0;
-      font-size: 15px;
-      letter-spacing: 0;
-    }
-    .count {
-      color: var(--muted);
-      font-size: 12px;
-      white-space: nowrap;
-    }
-    .chart {
-      padding: 12px 14px 4px;
-      border-bottom: 1px solid var(--line);
-    }
-    .bar-row {
-      display: grid;
-      grid-template-columns: minmax(100px, 1fr) minmax(120px, 2fr) 90px;
-      gap: 10px;
-      align-items: center;
-      margin-bottom: 8px;
-      color: var(--muted);
-      font-size: 12px;
-    }
-    .bar-label {
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .bar-track {
-      height: 8px;
-      border-radius: 6px;
-      background: #edf0ef;
-      overflow: hidden;
-    }
-    .bar-fill {
-      height: 100%;
-      border-radius: 6px;
-      background: var(--accent);
-      min-width: 2px;
-    }
-    .table-wrap {
-      overflow: auto;
-      max-height: calc(100vh - 270px);
-    }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      table-layout: fixed;
-      min-width: 830px;
-    }
-    th, td {
-      border-bottom: 1px solid var(--line);
-      padding: 9px 8px;
-      text-align: left;
-      vertical-align: middle;
-    }
-    th {
-      position: sticky;
-      top: 0;
-      background: #fbfcfc;
-      color: var(--muted);
-      z-index: 1;
-      font-size: 12px;
-      font-weight: 650;
-      cursor: pointer;
-      white-space: nowrap;
-    }
-    td {
-      font-size: 13px;
-    }
-    .col-title { width: 238px; }
-    .col-total { width: 86px; }
-    .col-output { width: 78px; }
-    .col-cost { width: 72px; }
-    .col-cache { width: 82px; }
-    .col-turns { width: 58px; }
-    .col-model { width: 112px; }
-    .col-effort { width: 76px; }
-    th[data-sort="total_tokens"],
-    th[data-sort="output_tokens"],
-    th[data-sort="estimated_cost_usd"],
-    th[data-sort="cached_input_percent"],
-    th[data-sort="turn_count"] {
-      text-align: right;
-    }
-    th[data-sort="model"],
-    th[data-sort="effort"] {
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-    tr:hover td { background: #f7faf9; }
-    tr.selected td { background: var(--soft); }
-    tr.project-group-row td {
-      background: #fbfcfc;
-      padding: 10px 12px;
-      border-top: 1px solid var(--line);
-      border-bottom: 1px solid var(--line);
-    }
-    tr.project-group-row:hover td {
-      background: #f4f8f6;
-    }
-    tr.project-group-row .project-aggregate-cell {
-      color: var(--project-summary);
-      font-size: 12px;
-      font-weight: 700;
-    }
-    tr.project-group-row .project-total-cell {
-      font-weight: 800;
-    }
-    .project-title-cell {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      gap: 12px;
-      align-items: center;
-      min-width: 0;
-    }
-    .project-toggle {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      min-width: 0;
-      width: 100%;
-      min-height: 30px;
-      padding: 0;
-      border: 0;
-      background: transparent;
-      text-align: left;
-    }
-    .project-folder-icon {
-      width: 18px;
-      height: 18px;
-      flex: 0 0 auto;
-      color: var(--accent);
-    }
-    .project-name {
-      min-width: 0;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-      font-weight: 750;
-    }
-    .project-meta {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      margin: 2px 0 0 30px;
-      color: var(--muted);
-      font-size: 12px;
-      white-space: nowrap;
-    }
-    .project-session-row .title-cell {
+/* Quiet precision: one working surface, explicit numerical hierarchy. */
+:root {
+  color-scheme: light;
+  --bg:#f5f5f7; --panel:#ffffff; --elevated:#ffffff; --soft:#eceef2;
+  --text:#202124; --muted:#606570; --line:#dedfe4; --control-line:#898e98; --hover:#f3f4f7;
+  --accent:#315fa8; --accent-2:#996222; --accent-3:#315fa8;
+  --project-summary: #2d5fa8; --danger:#b42334; --success:#28734b;
+  --selection:#eaf0fa; --on-accent:#ffffff; --cached:#3c7b70; --reasoning:#77609e;
+  --shadow:0 8px 28px rgb(24 30 44 / .12); --scrim:rgb(20 25 36 / .36);
+  --space-1:4px; --space-2:8px; --space-3:12px; --space-4:16px;
+  --space-5:24px; --space-6:32px; --control:34px;
+  --radius-sm:6px; --radius:12px; --radius-lg:16px; --motion:120ms;
+  --font:"Segoe UI Variable Text","Segoe UI",-apple-system,BlinkMacSystemFont,sans-serif;
+  font-family:var(--font); font-synthesis:none;
+}
+:root[data-theme="dark"] {
+  color-scheme:dark; --bg:#191a1e; --panel:#23252a; --elevated:#2b2d34;
+  --soft:#30333b; --text:#f0f1f5; --muted:#aeb3c1; --line:#3b3e48; --control-line:#737b8c;
+  --hover:#2b2e36; --accent:#99baff; --accent-2:#deb582; --accent-3:#99baff;
+  --danger:#ff9da9; --success:#92cfab; --selection:#303f5a; --on-accent:#17263f;
+  --cached:#8bc7b6; --reasoning:#c4b0e7; --scrim:rgb(0 0 0 / .58);
+  --shadow:0 8px 28px rgb(0 0 0 / .28);
+}
+* { box-sizing:border-box; }
+[hidden] { display:none!important; }
+html { scroll-padding-top:112px; -webkit-tap-highlight-color:transparent; }
+body { margin:0; background:var(--bg); color:var(--text); font-size:14px; line-height:1.45; }
+body.data-loading,body.modal-open { overflow:hidden; }
+button,select,input { font:inherit; color:var(--text); background:var(--panel); border:1px solid var(--line); border-radius:var(--radius-sm); min-height:var(--control); min-width:0; }
+button { cursor:pointer; padding:0 11px; font-weight:550; touch-action:manipulation; transition:background-color var(--motion),border-color var(--motion); }
+button:hover { background:var(--hover); border-color:var(--muted); }
+button:active { background:var(--soft); }
+button:disabled { opacity:.5; cursor:default; }
+button.primary { background:var(--accent); border-color:var(--accent); color:var(--on-accent); }
+button.primary:hover { filter:brightness(.94); }
+input,select { width:100%; padding:0 10px; background-color:var(--panel); color:var(--text); border-color:var(--control-line); }
+input::placeholder { color:var(--muted); opacity:1; }
+:focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
+h1,h2,h3 { text-wrap:balance; scroll-margin-top:112px; }
+.skip-link { position:fixed; left:16px; top:-70px; z-index:100; padding:10px 16px; border-radius:6px; background:var(--text); color:var(--panel); }
+.skip-link:focus { top:10px; }
+.sr-only { position:absolute; width:1px; height:1px; overflow:hidden; clip-path:inset(50%); white-space:nowrap; }
+header { position:sticky; top:0; z-index:10; border-bottom:1px solid var(--line); background:var(--bg); }
+.header-inner { max-width:1840px; margin:auto; padding:16px 32px 12px; display:grid; grid-template-columns:1fr auto; gap:12px 24px; align-items:center; }
+.brand { min-width:0; }
+h1 { margin:0; font-size:20px; font-weight:650; letter-spacing:-.5px; line-height:1.3; }
+.toolbar { display:flex; align-items:center; justify-content:flex-end; gap:8px; grid-column:2; grid-row:1; }
+.period-wrap { position:relative; min-width:0; grid-column:1; grid-row:2; justify-self:start; }
+.period-toggle,.lang-toggle,.sort-toggle { display:flex; align-items:center; gap:2px; background:var(--soft); border-radius:8px; padding:3px; }
+.period-toggle { min-width:0; }
+.period-option,.lang-option,.sort-option { min-height:28px; background:transparent; border:1px solid transparent; padding:0 12px; color:var(--muted); white-space:nowrap; font-size:13px; }
+.period-option.active,.lang-option.active,.sort-option.active { background:var(--panel); color:var(--text); border-color:var(--line); box-shadow:0 1px 2px rgb(0 0 0 / .04); }
+.lang-option { padding:0 8px; }
+.source-disclosure { grid-column:2; grid-row:2; justify-self:end; position:relative; min-width:0; max-width:100%; }
+.source-disclosure summary { color:var(--muted); font-size:12px; cursor:pointer; min-height:32px; display:flex; align-items:center; gap:7px; }
+.source-disclosure summary::before { content:''; width:6px; height:6px; border-radius:50%; background:var(--success); flex-shrink:0; }
+.source-disclosure.has-warning summary::before { background:var(--danger); }
+.source-disclosure summary::after { content:'⌄'; font-size:14px; }
+.source-body { position:absolute; top:100%; right:0; width:420px; max-width:calc(100vw - 32px); z-index:25; background:var(--elevated); border:1px solid var(--line); border-radius:var(--radius); padding:16px; box-shadow:var(--shadow); overflow-wrap:anywhere; }
+.source-entry + .source-entry { margin-top:14px; padding-top:14px; border-top:1px solid var(--line); }
+.source-entry strong { display:block; font-size:13px; }
+.source-entry p { margin:4px 0 0; color:var(--muted); font-size:12px; }
+main { max-width:1840px; margin:auto; padding:28px 32px 40px; }
+.metrics { display:grid; grid-template-columns:1.45fr 1fr 1fr 1.05fr; margin-bottom:28px; border-bottom:1px solid var(--line); padding:4px 0 28px; }
+.metric-cluster { display:grid; gap:20px; padding:0 24px; border-left:1px solid var(--line); align-content:start; min-width:0; }
+.metric { min-width:0; }
+.metric-primary { padding-right:28px; }
+.metric .label { font-size:13px; color:var(--muted); margin-bottom:4px; }
+.metric .value { font-size:24px; line-height:1.2; font-weight:600; letter-spacing:-.65px; font-variant-numeric:tabular-nums lining-nums; overflow-wrap:anywhere; }
+.metric-primary .value { font-size:clamp(42px,3.8vw,56px); letter-spacing:-2px; margin:8px 0; font-weight:550; }
+.metric .hint { color:var(--muted); font-size:12px; line-height:1.5; margin-top:4px; font-variant-numeric:tabular-nums; overflow-wrap:anywhere; }
+.metric-subset .value { font-size:20px; }
+.metric-subset .label::before { content:'↳ '; color:var(--muted); }
+.metric-sessions .label::before { content:none; }
+.metric-subset .hint { margin-top:2px; }
+.metric .subset-note { font-size:12px; color:var(--muted); margin-left:4px; }
+.controls { display:grid; grid-template-columns:minmax(200px,1fr) 140px 132px 150px auto 96px; gap:8px; margin:0 0 14px; align-items:center; }
+.sort-option { padding:0 10px; }
+.layout { display:grid; grid-template-columns:minmax(0,1fr) 400px; gap:20px; align-items:start; }
+section,aside { min-width:0; }
+.panel { min-width:0; background:var(--panel); border:1px solid var(--line); border-radius:var(--radius); overflow:hidden; }
+.panel-title { display:flex; justify-content:space-between; align-items:center; gap:12px; padding:16px 18px; border-bottom:1px solid var(--line); }
+.panel-title h2 { margin:0; font-size:14px; font-weight:650; }
+.count { color:var(--muted); font-size:12px; font-variant-numeric:tabular-nums; text-align:right; }
+.table-wrap { overflow:auto; max-height:calc(100vh - 365px); scrollbar-width:thin; overscroll-behavior:contain; }
+table { width:100%; border-collapse:collapse; table-layout:fixed; min-width:850px; }
+th,td { border-bottom:1px solid var(--line); padding:11px 10px; text-align:left; vertical-align:middle; }
+th { position:sticky; top:0; background:var(--panel); color:var(--muted); z-index:1; font-size:12px; font-weight:550; white-space:nowrap; }
+th[data-sort] { cursor:pointer; }
+th[aria-sort="ascending"]::after { content:' ↑'; color:var(--accent); }
+th[aria-sort="descending"]::after { content:' ↓'; color:var(--accent); }
+td { font-size:13px; }
+.col-title { width:auto; } .col-total { width:92px; } .col-output { width:82px; }
+.col-cost { width:80px; } .col-cache { width:80px; } .col-turns { width:56px; }
+.col-model { width:112px; } .col-effort { width:76px; }
+th[data-sort="total_tokens"],th[data-sort="output_tokens"],th[data-sort="estimated_cost_usd"],th[data-sort="cached_input_percent"],th[data-sort="turn_count"],.number { text-align:right; font-variant-numeric:tabular-nums lining-nums; white-space:nowrap; }
+th[data-sort="model"],th[data-sort="effort"],.model-cell,.effort-cell { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+tr[data-uid] { cursor:pointer; }
+tr:hover td { background:var(--hover); }
+tr.selected td { background:var(--selection); }
+tr.selected td:first-child { box-shadow:inset 3px 0 var(--accent); }
+tr:focus-visible { outline-offset:-3px; }
+tr.project-group-row td { background:var(--hover); padding:13px 10px; border-top:1px solid var(--line); }
+tr.project-group-row .project-aggregate-cell { color:var(--text); font-size:12px; font-weight:600; }
+tr.project-group-row .project-total-cell { font-weight:650; }
+.project-title-cell { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:8px; align-items:center; min-width:0; }
+.project-toggle { display:flex; align-items:center; gap:8px; min-width:0; width:100%; min-height:28px; padding:0; border:0; background:transparent; text-align:left; }
+.project-folder-icon { width:16px; height:16px; flex:0 0 auto; color:var(--muted); }
+.project-name { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:600; }
+.project-meta { display:flex; align-items:center; gap:6px; margin:3px 0 0 24px; color:var(--muted); font-size:12px; flex-wrap:wrap; }
+.project-session-row .title-cell {
       padding-left: 34px;
     }
-    .project-session-row .title-line {
-      gap: 8px;
-      margin-bottom: 0;
-    }
-    .task-root-row .title-line {
-      gap: 6px;
-    }
-    .project-session-row .title-main {
-      margin-bottom: 0;
-    }
-    .project-session-row .title-sub {
-      display: none;
-    }
-    .task-expandable-row .title-cell {
-      padding-left: 8px;
-    }
-    .task-static-row .title-cell {
-      padding-left: 32px;
-    }
-    .project-session-row.task-expandable-row .title-cell {
+.project-session-row .title-sub { display:none; }
+.task-expandable-row .title-cell { padding-left:8px; }
+.task-static-row .title-cell { padding-left:30px; }
+.project-session-row.task-expandable-row .title-cell {
       padding-left: 34px;
     }
-    .project-session-row.task-static-row .title-cell {
-      padding-left: 58px;
-    }
-    .task-child-row .title-cell {
-      padding-left: 48px;
-    }
-    .project-session-row.task-child-row .title-cell {
+.project-session-row.task-static-row .title-cell { padding-left:50px; }
+.task-child-row .title-cell { padding-left:42px; }
+.project-session-row.task-child-row .title-cell {
       padding-left: 74px;
     }
-    .task-toggle {
-      display: inline-grid;
-      place-items: center;
-      width: 18px;
-      min-width: 18px;
-      height: 22px;
-      padding: 0;
-      border: 0;
-      border-radius: 4px;
-      background: transparent;
-      color: var(--muted);
-    }
-    .task-toggle:hover {
-      background: #e8f1ee;
-      color: var(--accent);
-    }
-    .task-toggle::before {
-      content: '';
-      width: 6px;
-      height: 6px;
-      border-right: 2px solid currentColor;
-      border-bottom: 2px solid currentColor;
-      transform: rotate(-45deg);
-      transition: transform 120ms ease;
-    }
-    .task-toggle[aria-expanded="true"]::before {
-      transform: rotate(45deg) translate(-1px, -1px);
-    }
-    .task-expandable-row td {
-      cursor: pointer;
-    }
-    .project-more-row td {
-      background: #fff;
-      padding: 8px 8px 10px 34px;
-    }
-    .project-more-row:hover td {
-      background: #fff;
-    }
-    .project-more-btn {
-      min-height: 30px;
-      padding: 0 10px;
-      color: var(--accent);
-      border-color: #99c9bb;
-      background: #eef8f4;
-      font-weight: 700;
-    }
-    .rank {
-      color: var(--muted);
-      white-space: nowrap;
-      text-align: center;
-      padding-left: 4px;
-      padding-right: 4px;
-    }
-    .title-cell {
-      min-width: 0;
-    }
-    .title-line {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      min-width: 0;
-    }
-    .title-main {
-      font-weight: 650;
-      margin-bottom: 4px;
-      line-height: 1.35;
-      min-width: 0;
-      flex: 1 1 auto;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .title-time {
-      flex: 0 0 auto;
-      color: var(--muted);
-      font-size: 12px;
-      font-weight: 650;
-      white-space: nowrap;
-    }
-    .title-sub {
-      color: var(--muted);
-      font-size: 12px;
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      min-width: 0;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .title-sub-text {
-      min-width: 0;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .number {
-      font-variant-numeric: tabular-nums;
-      text-align: right;
-      white-space: nowrap;
-    }
-    .model-cell,
-    .effort-cell {
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .badge {
-      display: inline-flex;
-      align-items: center;
-      flex: 0 0 auto;
-      min-height: 22px;
-      padding: 2px 7px;
-      border-radius: 999px;
-      border: 1px solid var(--line);
-      background: #fff;
-      color: var(--muted);
-      font-size: 12px;
-      white-space: nowrap;
-    }
-    .badge.active { color: var(--accent); border-color: #99c9bb; background: #eef8f4; }
-    .badge.archived { color: var(--accent-2); border-color: #e3b887; background: #fff6ec; }
-    .badge.env { color: var(--accent-3); border-color: #a9c0df; background: #eef4fb; }
-    .badge.env.wsl { color: var(--accent); border-color: #99c9bb; background: #eef8f4; }
-    .badge.env.windows { color: var(--accent-3); border-color: #a9c0df; background: #eef4fb; }
-    .badge.env.remote { color: #7a4c12; border-color: #e3c27a; background: #fff8e5; }
-    .badge.branch {
-      width: 24px;
-      min-width: 24px;
-      min-height: 22px;
-      justify-content: center;
-      padding: 2px;
-      color: #5b4aa0;
-      border-color: #c3b8ee;
-      background: #f4f1ff;
-    }
-    .branch-icon {
-      width: 13px;
-      height: 13px;
-      flex: 0 0 auto;
-    }
-    .remote-mark {
-      margin-right: 4px;
-      font-weight: 800;
-      line-height: 1;
-    }
-    .details {
-      position: sticky;
-      top: 94px;
-      max-height: calc(100vh - 112px);
-      overflow: auto;
-    }
-    .details-body {
-      padding: 14px;
-    }
-    .empty {
-      color: var(--muted);
-      padding: 22px 14px;
-      text-align: center;
-    }
-    .detail-title {
-      font-size: 17px;
-      font-weight: 750;
-      line-height: 1.35;
-      margin-bottom: 8px;
-      overflow-wrap: anywhere;
-    }
-    .detail-badges {
-      display: flex;
-      flex-wrap: wrap;
-      align-items: center;
-      gap: 6px;
-    }
-    .detail-meta {
-      display: grid;
-      gap: 8px;
-      margin: 12px 0;
-    }
-    .kv {
-      display: grid;
-      grid-template-columns: 110px minmax(0, 1fr);
-      gap: 10px;
-      color: var(--muted);
-      font-size: 12px;
-    }
-    .kv strong {
-      color: var(--text);
-      font-weight: 550;
-      overflow-wrap: anywhere;
-    }
-    .breakdown {
-      display: grid;
-      gap: 8px;
-      margin: 14px 0;
-    }
-    .breakdown-row {
-      display: grid;
-      grid-template-columns: 92px minmax(100px, 1fr) 148px;
-      gap: 8px;
-      align-items: center;
-      font-size: 12px;
-      color: var(--muted);
-    }
-    .breakdown-value {
-      display: flex;
-      justify-content: flex-end;
-      gap: 8px;
-      white-space: nowrap;
-    }
-    .breakdown-value strong {
-      color: var(--text);
-      font-weight: 650;
-    }
-    .price-tooltip-trigger {
-      cursor: help;
-      text-decoration-line: underline;
-      text-decoration-style: dotted;
-      text-underline-offset: 3px;
-    }
-    .price-tooltip-trigger:focus-visible {
-      outline: 2px solid var(--accent);
-      outline-offset: 2px;
-      border-radius: 2px;
-    }
-    .breakdown-row .bar-fill.input { background: var(--accent-3); }
-    .breakdown-row .bar-fill.cached { background: var(--accent); }
-    .breakdown-row .bar-fill.cache-write { background: #b64b72; }
-    .breakdown-row .bar-fill.output { background: var(--accent-2); }
-    .breakdown-row .bar-fill.reasoning { background: #6f6a25; }
-    canvas {
-      width: 100%;
-      height: 150px;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: #fbfcfc;
-      display: block;
-    }
-    .section-label {
-      margin: 16px 0 8px;
-      color: var(--muted);
-      font-size: 12px;
-      font-weight: 700;
-      text-transform: uppercase;
-    }
-    .mini-table {
-      min-width: 0;
-      font-size: 12px;
-    }
-    .timeline-table {
-      min-width: 680px;
-    }
-    .mini-table th, .mini-table td {
-      padding: 7px 8px;
-    }
-    .mini-table th {
-      position: static;
-      cursor: default;
-    }
-    .path {
-      font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
-      font-size: 12px;
-      overflow-wrap: anywhere;
-    }
-    .notice {
-      margin-top: 10px;
-      color: var(--muted);
-      font-size: 12px;
-      line-height: 1.5;
-    }
-    .task-detail-summary {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      gap: 8px 14px;
-      align-items: center;
-      margin: 14px 0;
-      padding: 10px 12px;
-      border: 1px solid #99c9bb;
-      border-radius: 6px;
-      background: #eef8f4;
-    }
-    .task-detail-summary-label {
-      color: var(--accent);
-      font-size: 12px;
-      font-weight: 750;
-    }
-    .task-detail-summary-value {
-      color: var(--text);
-      font-size: 15px;
-      font-variant-numeric: tabular-nums;
-      font-weight: 750;
-      white-space: nowrap;
-    }
-    .task-detail-summary-meta {
-      grid-column: 1 / -1;
-      color: var(--muted);
-      font-size: 12px;
-    }
-    .error {
-      color: var(--danger);
-      padding: 14px;
-    }
-    @media (max-width: 1100px) {
-      .header-inner { grid-template-columns: 1fr; align-items: flex-start; }
-      .period-wrap { justify-self: start; width: 100%; max-width: 620px; }
-      .period-toggle { width: 100%; min-width: 0; }
-      .toolbar { justify-self: start; justify-content: flex-start; }
-      .metrics { grid-template-columns: repeat(3, minmax(130px, 1fr)); }
-      .controls { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-      .layout { grid-template-columns: 1fr; }
-      .details { position: static; max-height: none; }
-      .table-wrap { max-height: none; }
-    }
-    @media (max-width: 760px) {
-      .header-inner { grid-template-columns: 1fr; padding: 16px; }
-      main { padding: 16px; }
-      .toolbar { justify-content: flex-start; }
-      .period-toggle { grid-template-columns: repeat(7, minmax(0, 1fr)); }
-      .period-option { padding: 0 6px; }
-      .calendar-popover { left: 0; transform: none; width: min(358px, calc(100vw - 32px)); }
-      .metrics { grid-template-columns: repeat(2, minmax(120px, 1fr)); }
-      .controls { grid-template-columns: 1fr; }
-      .project-title-cell { grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
-      .project-meta { flex-wrap: wrap; }
-      .project-session-row .title-cell { padding-left: 34px; }
-      .bar-row { grid-template-columns: 1fr; gap: 4px; }
-      .breakdown-row { grid-template-columns: 64px minmax(0, 1fr) minmax(112px, auto); gap: 6px; }
-      .breakdown-value { gap: 5px; }
-      .kv { grid-template-columns: 1fr; gap: 2px; }
-    }
+.task-toggle { display:inline-grid; place-items:center; width:22px; min-width:22px; min-height:28px; padding:0; border:0; background:transparent; color:var(--muted); }
+.task-toggle::before { content:''; width:6px; height:6px; border-right:1.5px solid currentColor; border-bottom:1.5px solid currentColor; transform:rotate(-45deg); transition:transform var(--motion); }
+.task-toggle[aria-expanded="true"]::before { transform:rotate(45deg); }
+.project-more-row td { padding:8px 10px 12px 28px; }
+.project-more-btn { min-height:28px; font-size:12px; color:var(--accent); border:0; background:var(--hover); }
+.title-cell,.title-main,.title-sub-text { min-width:0; }
+.title-line { display:flex; align-items:center; gap:8px; min-width:0; }
+.title-main { flex:1 1 auto; font-weight:500; line-height:1.45; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.title-time { flex:0 0 auto; color:var(--muted); font-size:12px; white-space:nowrap; }
+.title-sub { color:var(--muted); font-size:12px; display:flex; align-items:center; gap:6px; overflow:hidden; white-space:nowrap; }
+.title-sub-text { overflow:hidden; text-overflow:ellipsis; }
+.badge { display:inline-flex; align-items:center; flex:0 0 auto; min-height:21px; padding:1px 6px; border-radius:4px; border:1px solid var(--line); background:var(--panel); color:var(--muted); font-size:12px; white-space:nowrap; }
+.badge.active { color:var(--success); } .badge.archived { color:var(--accent-2); }
+.badge.env { color:var(--accent); background:var(--selection); border-color:transparent; }
+.badge.branch { width:23px; justify-content:center; padding:2px; color:var(--reasoning); }
+.branch-icon { width:13px; height:13px; flex:0 0 auto; }
+.remote-mark { margin-right:4px; }
+.details { position:sticky; top:118px; max-height:calc(100vh - 140px); overflow:auto; scrollbar-width:thin; }
+.details-body { padding:20px; }
+.detail-title { font-size:18px; font-weight:600; line-height:1.45; margin-bottom:12px; overflow-wrap:anywhere; }
+.detail-badges { display:flex; flex-wrap:wrap; gap:6px; align-items:center; }
+.section-label { margin:24px 0 12px; font-size:13px; font-weight:600; color:var(--text); }
+.detail-meta { display:grid; gap:10px; margin:12px 0; }
+.kv { display:grid; grid-template-columns:104px minmax(0,1fr); gap:12px; color:var(--muted); font-size:12px; }
+.kv strong { color:var(--text); font-weight:500; overflow-wrap:anywhere; font-variant-numeric:tabular-nums; }
+.path { font-family:Consolas,ui-monospace,monospace; font-size:12px; overflow-wrap:anywhere; }
+.breakdown { display:grid; gap:12px; margin:18px 0; }
+.breakdown-row { display:grid; grid-template-columns:64px minmax(28px,1fr) auto; gap:8px; align-items:center; font-size:12px; color:var(--muted); }
+.breakdown-value { display:flex; justify-content:flex-end; gap:7px; white-space:nowrap; font-variant-numeric:tabular-nums; }
+.breakdown-value strong { color:var(--text); font-weight:550; }
+.price-tooltip-trigger { cursor:help; text-decoration:underline dotted; text-underline-offset:3px; }
+.bar-track { height:5px; border-radius:3px; background:var(--soft); overflow:hidden; }
+.bar-fill { height:100%; min-width:2px; border-radius:3px; background:var(--accent); }
+.bar-fill.input { background:var(--accent-3); } .bar-fill.cached { background:var(--cached); }
+.bar-fill.output { background:var(--accent-2); } .bar-fill.reasoning,.bar-fill.cache-write { background:var(--reasoning); }
+canvas { width:100%; height:150px; display:block; border-radius:8px; background:var(--panel); }
+.curve-caption { display:flex; justify-content:space-between; color:var(--muted); font-size:12px; margin-top:6px; }
+.provenance-disclosure { margin-top:20px; border-top:1px solid var(--line); padding-top:16px; }
+.provenance-disclosure summary { font-weight:600; cursor:pointer; font-size:13px; }
+.mini-table { min-width:0; font-size:12px; }
+.mini-table th,.mini-table td { padding:8px 6px; }
+.mini-table th { position:static; cursor:default; }
+.timeline-table { min-width:680px; }
+.notice { margin-top:10px; color:var(--muted); font-size:13px; line-height:1.6; overflow-wrap:anywhere; max-width:80ch; }
+.task-detail-summary { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:8px 12px; margin:18px 0; padding:12px; border-radius:8px; background:var(--selection); }
+.task-detail-summary-label { color:var(--accent); font-size:12px; font-weight:600; }
+.task-detail-summary-value { font-size:18px; font-weight:600; font-variant-numeric:tabular-nums; }
+.task-detail-summary-meta { grid-column:1/-1; font-size:12px; color:var(--muted); }
+.empty { padding:32px 20px; color:var(--muted); text-align:center; font-size:13px; }
+.error { color:var(--danger); padding:16px; overflow-wrap:anywhere; }
+.loading-overlay { position:fixed; inset:0; z-index:60; display:grid; place-items:center; padding:24px; background:var(--scrim); }
+.loading-indicator { display:flex; align-items:center; gap:12px; padding:14px 18px; border-radius:var(--radius); background:var(--elevated); box-shadow:var(--shadow); }
+.loading-spinner { width:20px; height:20px; flex:0 0 20px; border:2px solid var(--line); border-top-color:var(--accent); border-radius:50%; animation:loading-spin .8s linear infinite; }
+@keyframes loading-spin { to { transform:rotate(360deg); } }
+.calendar-popover { position:absolute; left:0; top:calc(100% + 10px); width:370px; padding:16px; background:var(--elevated); border:1px solid var(--line); border-radius:var(--radius); box-shadow:var(--shadow); z-index:30; max-height:calc(100dvh - 140px); overflow:auto; overscroll-behavior:contain; }
+.calendar-head { display:grid; grid-template-columns:34px minmax(0,1fr) 34px; gap:8px; align-items:center; margin-bottom:12px; }
+.calendar-title { display:flex; justify-content:center; align-items:center; min-width:0; font-size:14px; font-weight:600; }
+.calendar-title-button { padding:0 5px; border:0; background:transparent; font:inherit; }
+.calendar-title-caret { margin-left:3px; color:var(--muted); font-size:10px; }
+.calendar-actions { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:12px; }
+.calendar-grid { display:grid; grid-template-columns:repeat(7,minmax(0,1fr)); gap:4px; }
+.calendar-weekday { font-size:12px; color:var(--muted); text-align:center; padding:4px 0; }
+.calendar-day { display:grid; grid-template-rows:16px 14px; gap:3px; align-content:center; min-height:44px; padding:4px 1px; font-size:13px; line-height:1; text-align:center; border-color:transparent; background:transparent; }
+.calendar-day.outside { color:var(--muted); }
+.calendar-day.in-range,.calendar-picker-option.in-range { background:var(--selection); border-color:var(--line); }
+.calendar-day.range-edge,.calendar-picker-option.selected { background:var(--accent); color:var(--on-accent); border-color:var(--accent); }
+.calendar-usage,.calendar-picker-usage { color:var(--muted); font-size:11px; line-height:1.2; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-variant-numeric:tabular-nums; }
+.calendar-day.range-edge .calendar-usage,.calendar-picker-option.selected .calendar-picker-usage { color:var(--on-accent); }
+.calendar-picker-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); grid-auto-rows:64px; align-content:center; gap:6px; min-height:295px; }
+.calendar-picker-option { display:grid; grid-template-rows:18px 15px; align-content:center; gap:3px; padding:0 6px; font-size:13px; font-weight:550; }
+.calendar-picker-usage,.calendar-day-loading { display:grid; place-items:center; }
+.calendar-picker-spinner,.calendar-day-spinner { width:12px; height:12px; flex:none; border-width:2px; justify-self:center; }
+.modal-backdrop { position:fixed; inset:0; z-index:40; display:grid; place-items:center; padding:24px; background:var(--scrim); }
+.modal { width:min(760px,100%); max-height:calc(100dvh - 48px); overflow:auto; overscroll-behavior:contain; border:1px solid var(--line); border-radius:var(--radius-lg); background:var(--elevated); box-shadow:var(--shadow); }
+.modal-head,.modal-actions { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:18px 20px; border-bottom:1px solid var(--line); }
+.modal-head h2 { margin:0; font-size:16px; font-weight:600; }
+.modal-actions { border-top:1px solid var(--line); border-bottom:0; justify-content:flex-end; }
+.modal-body { display:grid; gap:16px; padding:20px; min-width:0; overflow-x:auto; }
+.remote-table { min-width:630px; font-size:12px; }
+.remote-table th { position:static; }
+.remote-table th:nth-child(1) { width:16%; } .remote-table th:nth-child(2) { width:16%; }
+.remote-table th:nth-child(3) { width:8%; } .remote-table th:nth-child(4),.remote-table th:nth-child(5) { width:17%; }
+.remote-table th:nth-child(6) { width:26%; }
+.remote-table td,.remote-table th { padding:8px 6px; }
+.remote-count { font-variant-numeric:tabular-nums; text-align:right; }
+.remote-date,.remote-code { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.remote-actions { display:flex; gap:4px; justify-content:flex-end; }
+.remote-actions button { font-size:12px; padding:0 6px; }
+.inline-form { display:grid; gap:8px; } .inline-form label { font-size:13px; color:var(--muted); }
+.status-line { font-size:13px; color:var(--muted); line-height:1.5; overflow-wrap:anywhere; }
+.status-line.error-text,.danger { color:var(--danger); }
+@media (min-width:1600px) { .layout { grid-template-columns:minmax(0,1fr) 420px; gap:24px; } }
+@media (max-width:1279px) {
+  .layout { grid-template-columns:minmax(0,1fr); }
+  .details { position:static; max-height:none; }
+  .table-wrap { max-height:620px; }
+  .controls { grid-template-columns:minmax(180px,1fr) repeat(3,minmax(110px,1fr)); }
+  .sort-toggle { grid-column:1/3; justify-self:start; } #limitSelect { grid-column:3/5; }
+  .metrics { grid-template-columns:1.15fr 1fr 1fr 1fr; }
+  .metric-cluster { padding:0 16px; }
+}
+@media (max-width:900px) {
+  .header-inner { padding:14px 24px 12px; gap:10px 12px; }
+  .toolbar { gap:6px; flex-wrap:wrap; }
+  .source-disclosure summary { max-width:190px; }
+  main { padding:24px; }
+  .metric-cluster { padding:0 12px; }
+  .metric .value { font-size:22px; } .metric-primary .value { font-size:42px; }
+}
+@media (max-width:700px) {
+  html { scroll-padding-top:16px; }
+  header { position:relative; }
+  .header-inner { display:flex; flex-wrap:wrap; padding:16px; gap:14px 10px; }
+  .brand { flex:1 1 100%; } h1 { font-size:20px; }
+  .toolbar { flex:1 1 100%; order:2; justify-content:flex-start; gap:6px; }
+  .toolbar { display:grid; grid-template-columns:auto minmax(0,1fr) auto; align-items:center; }
+  #remoteBtn { grid-column:1/3; } #snapshotExportBtn { grid-column:3; }
+  .toolbar button { font-size:12px; padding:0 8px; }
+  .period-wrap { order:3; width:100%; } .period-toggle { display:grid; grid-template-columns:repeat(7,minmax(0,1fr)); }
+  .period-option { padding:0 2px; font-size:12px; }
+  .source-disclosure { order:4; width:100%; }
+  .source-disclosure summary { max-width:none; } .source-body { left:0; right:auto; width:100%; }
+  main { padding:20px 16px 32px; padding-bottom:max(32px,env(safe-area-inset-bottom)); }
+  .metrics { grid-template-columns:repeat(2,minmax(0,1fr)); gap:22px 0; padding-bottom:22px; margin-bottom:20px; }
+  .metric-primary { grid-column:1/-1; padding:0 0 18px; border-bottom:1px solid var(--line); }
+  .metric-primary .value { font-size:48px; }
+  .metric-cluster { padding:0; border:0; gap:18px; }
+  .metric-cluster:nth-child(3) { padding-left:16px; border-left:1px solid var(--line); }
+  .metric-cluster:last-child { grid-column:1/-1; display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); border-top:1px solid var(--line); padding-top:18px; gap:16px; }
+  .metric .value { font-size:22px; } .metric-primary .value { font-size:48px; }
+  .metric .hint { font-size:12px; }
+  .controls { grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; }
+  #searchInput { grid-column:1/-1; } .sort-toggle { grid-column:1/-1; justify-self:stretch; }
+  .sort-option { flex:1; } #limitSelect { grid-column:auto; }
+  .panel-title { padding:14px; } .table-wrap { max-height:540px; }
+  .details-body { padding:16px; } .details { scroll-margin-top:16px; }
+  .calendar-popover { width:min(370px,calc(100vw - 32px)); max-height:calc(100dvh - 32px); }
+  .modal-backdrop { padding:12px; } .modal { max-height:calc(100dvh - 24px); }
+  .modal-head,.modal-actions,.modal-body { padding:16px; }
+  .kv { grid-template-columns:92px minmax(0,1fr); gap:10px; }
+  button,select,input { min-height:38px; } .period-option,.lang-option,.sort-option { min-height:32px; }
+}
+@media (prefers-reduced-motion:reduce) { *,*::before,*::after { animation:none!important; transition:none!important; scroll-behavior:auto!important; } }
+#sessionRows tr { content-visibility:auto; contain-intrinsic-size:auto 44px; }
+.timeline-table tbody tr { content-visibility:auto; contain-intrinsic-size:auto 34px; }
+
+.loading-overlay[hidden] { display:none; }
+
   </style>
 </head>
 <body>
+  <a href="#dashboardMain" class="skip-link" data-i18n="skipMain">跳到主要内容</a>
   <div class="loading-overlay" id="loadingOverlay" role="status" aria-live="polite" aria-atomic="true">
     <div class="loading-indicator">
       <span class="loading-spinner" aria-hidden="true"></span>
@@ -6115,8 +5409,7 @@ HTML = r"""<!doctype html>
   <header>
     <div class="header-inner">
       <div class="brand">
-        <h1>Codex Usage Dashboard</h1>
-        <div class="subtitle" id="codexHome" data-i18n="subtitle">读取本地 Codex 会话日志</div>
+        <h1 translate="no">Codex Usage</h1>
       </div>
       <div class="period-wrap" id="periodWrap">
         <div class="period-toggle" aria-label="统计区间" data-i18n-aria="period">
@@ -6126,15 +5419,25 @@ HTML = r"""<!doctype html>
           <button class="period-option" data-period-button="week" data-i18n="periodWeek" type="button">本周</button>
           <button class="period-option" data-period-button="month" data-i18n="periodMonth" type="button">本月</button>
           <button class="period-option" data-period-button="all" data-i18n="periodAll" type="button">全部</button>
-          <button class="period-option" id="calendarBtn" data-i18n="calendarButton" type="button">日期</button>
+          <button class="period-option" id="calendarBtn" aria-haspopup="dialog" aria-expanded="false" aria-controls="calendarPopover" data-i18n="calendarButton" type="button">日期</button>
         </div>
-        <div class="calendar-popover" id="calendarPopover" hidden></div>
+        <div class="calendar-popover" id="calendarPopover" role="dialog" aria-label="日期范围" data-i18n-aria="calendarButton" hidden></div>
       </div>
+      <details class="source-disclosure" id="sourceDisclosure">
+        <summary id="codexHome" aria-controls="sourceStatusBody">本地来源</summary>
+        <div class="source-body" id="sourceStatusBody"></div>
+      </details>
       <div class="toolbar">
         <div class="lang-toggle" aria-label="语言" data-i18n-aria="language">
           <button class="lang-option active" data-lang-button="zh" type="button">中文</button>
           <button class="lang-option" data-lang-button="en" type="button">EN</button>
         </div>
+        <label class="sr-only" for="themeSelect" data-i18n="appearance">外观</label>
+        <select id="themeSelect" name="appearance" style="width:auto" aria-label="外观" data-i18n-aria="appearance">
+          <option value="system" data-i18n="themeSystem">跟随系统</option>
+          <option value="light" data-i18n="themeLight">浅色</option>
+          <option value="dark" data-i18n="themeDark">深色</option>
+        </select>
         <button id="refreshBtn" class="primary" title="重新扫描本地日志" data-i18n="refresh" data-i18n-title="refreshTitle">刷新</button>
         <button id="remoteBtn" title="导入远程数据" data-i18n="importRemote" data-i18n-title="importRemoteTitle">导入远程数据</button>
         <button id="snapshotExportBtn" title="导出当前设备快照" data-i18n="exportSnapshot" data-i18n-title="exportSnapshotTitle">导出快照</button>
@@ -6142,7 +5445,7 @@ HTML = r"""<!doctype html>
     </div>
   </header>
 
-  <input id="remoteFileInput" type="file" accept="application/json,.json" hidden>
+  <input aria-label="导入快照文件" name="snapshot" id="remoteFileInput" type="file" accept="application/json,.json" hidden>
   <div class="modal-backdrop" id="remoteModal" hidden>
     <div class="modal" role="dialog" aria-modal="true" aria-labelledby="remoteModalTitle">
       <div class="modal-head">
@@ -6160,16 +5463,16 @@ HTML = r"""<!doctype html>
     <div class="metrics" id="metrics"></div>
 
     <div class="controls">
-      <input id="searchInput" type="search" placeholder="搜索标题、项目、路径、模型、环境" data-i18n-placeholder="searchPlaceholder">
-      <select id="environmentFilter" title="环境" data-i18n-title="environment">
+      <input id="searchInput" name="search" aria-label="搜索对话" data-i18n-aria="searchLabel" autocomplete="off" type="search" placeholder="搜索标题、项目、路径、模型、环境" data-i18n-placeholder="searchPlaceholder">
+      <select id="environmentFilter" name="environmentFilter" aria-label="environment" data-i18n-aria="environment" title="环境" data-i18n-title="environment">
         <option value="all">全部环境</option>
       </select>
-      <select id="sourceFilter" title="状态" data-i18n-title="source">
+      <select id="sourceFilter" name="sourceFilter" aria-label="source" data-i18n-aria="source" title="状态" data-i18n-title="source">
         <option value="all">全部状态</option>
         <option value="active">当前会话</option>
         <option value="archived">归档会话</option>
       </select>
-      <select id="modelFilter" title="模型" data-i18n-title="model">
+      <select id="modelFilter" name="modelFilter" aria-label="model" data-i18n-aria="model" title="模型" data-i18n-title="model">
         <option value="all">全部模型</option>
       </select>
       <div class="sort-toggle" aria-label="视图" data-i18n-aria="view">
@@ -6177,7 +5480,7 @@ HTML = r"""<!doctype html>
         <button class="sort-option" data-view-button="recent" data-i18n="recent" type="button">最近</button>
         <button class="sort-option" data-view-button="total" data-i18n="total" type="button">总量</button>
       </div>
-      <select id="limitSelect" title="显示数量" data-i18n-title="limitTitle">
+      <select id="limitSelect" name="limitSelect" aria-label="limitTitle" data-i18n-aria="limitTitle" title="显示数量" data-i18n-title="limitTitle">
         <option value="50">前 50</option>
         <option value="100">前 100</option>
         <option value="all">全部</option>
@@ -6188,10 +5491,10 @@ HTML = r"""<!doctype html>
       <section class="panel">
         <div class="panel-title">
           <h2 data-i18n="conversations">对话</h2>
-          <div class="count" id="resultCount" data-i18n="loading">加载中</div>
+          <div class="count" id="resultCount" role="status" aria-live="polite" data-i18n="loading">加载中</div>
         </div>
         <div class="table-wrap">
-          <table>
+          <table aria-label="对话用量" data-i18n-aria="conversations">
             <colgroup>
               <col class="col-title">
               <col class="col-total">
@@ -6204,14 +5507,14 @@ HTML = r"""<!doctype html>
             </colgroup>
             <thead>
               <tr>
-                <th data-sort="title" data-i18n="conversation">对话</th>
-                <th data-sort="total_tokens" data-i18n="total">总量</th>
-                <th data-sort="output_tokens" data-i18n="output">输出</th>
-                <th data-sort="estimated_cost_usd" data-i18n="cost">花费</th>
-                <th data-sort="cached_input_percent" data-i18n="cacheHit">缓存命中</th>
-                <th data-sort="turn_count" data-i18n="turns">轮次</th>
-                <th data-sort="model" data-i18n="model">模型</th>
-                <th data-sort="effort" data-i18n="reasoningEffort">推理强度</th>
+                <th scope="col" tabindex="0" aria-sort="none" data-sort="title" data-i18n="conversation">对话</th>
+                <th scope="col" tabindex="0" aria-sort="none" data-sort="total_tokens" data-i18n="total">总量</th>
+                <th scope="col" tabindex="0" aria-sort="none" data-sort="output_tokens" data-i18n="output">输出</th>
+                <th scope="col" tabindex="0" aria-sort="none" data-sort="estimated_cost_usd" data-i18n="cost">花费</th>
+                <th scope="col" tabindex="0" aria-sort="none" data-sort="cached_input_percent" data-i18n="cacheHit">缓存命中</th>
+                <th scope="col" tabindex="0" aria-sort="none" data-sort="turn_count" data-i18n="turns">轮次</th>
+                <th scope="col" tabindex="0" aria-sort="none" data-sort="model" data-i18n="model">模型</th>
+                <th scope="col" tabindex="0" aria-sort="none" data-sort="effort" data-i18n="reasoningEffort">推理强度</th>
               </tr>
             </thead>
             <tbody id="sessionRows">
@@ -6224,7 +5527,7 @@ HTML = r"""<!doctype html>
       <aside class="panel details">
         <div class="panel-title">
           <h2 data-i18n="conversationDetails">对话明细</h2>
-          <div class="count" id="detailStatus" data-i18n="notSelected">未选择</div>
+          <div class="count" id="detailStatus" role="status" aria-live="polite" data-i18n="notSelected">未选择</div>
         </div>
         <div class="details-body" id="detailsBody">
           <div class="empty" data-i18n="selectRow">点击左侧任意一行查看 token 明细和时间线。</div>
@@ -6282,6 +5585,7 @@ HTML = r"""<!doctype html>
 
     const I18N = {
       zh: {
+        skipMain:'跳到主要内容', appearance:'外观', themeSystem:'跟随系统', themeLight:'浅色', themeDark:'深色', searchLabel:'搜索对话', subsetInput:'输入中的缓存', subsetOutput:'输出中的推理', apiEquivalent:'API 等效估算', sourcesLabel:'本地来源', available:'可用', unavailable:'不可用', latestScan:'最近扫描', sourceFiles:'文件', sourceAdded:'新增会话', provenanceLabel:'来源与工作区', contextLabel:'模型与运行上下文', usageLabel:'Token 明细', chartHelp:'按事件顺序排列；左右方向键查看精确值', fullTimeline:'完整事件明细', totalOverview:'总 Tokens', uncachedInput:'未缓存输入', retryHint:'请刷新重试；若仍失败，检查本地来源是否可访问。',
         subtitle: '读取本地 Codex 会话日志',
         refresh: '刷新',
         refreshTitle: '重新扫描本地日志',
@@ -6337,7 +5641,7 @@ HTML = r"""<!doctype html>
         calendarMonths: '月份',
         calendarYears: '年份',
         calendarWeekdays: ['一', '二', '三', '四', '五', '六', '日'],
-        searchPlaceholder: '搜索标题、项目、路径、模型、环境',
+        searchPlaceholder: '搜索对话、项目或模型…',
         environment: '环境',
         environmentAll: '全部环境',
         source: '状态',
@@ -6461,6 +5765,7 @@ HTML = r"""<!doctype html>
         countPoints: '{count} 次计数',
       },
       en: {
+        skipMain:'Skip to content', appearance:'Appearance', themeSystem:'System', themeLight:'Light', themeDark:'Dark', searchLabel:'Search conversations', subsetInput:'Subset of input', subsetOutput:'Subset of output', apiEquivalent:'API-equivalent estimate', sourcesLabel:'Local sources', available:'Available', unavailable:'Unavailable', latestScan:'Last scanned', sourceFiles:'files', sourceAdded:'added sessions', provenanceLabel:'Sources & workspace', contextLabel:'Model & execution context', usageLabel:'Token breakdown', chartHelp:'Event order; use arrow keys for exact values', fullTimeline:'All token events', totalOverview:'Total Tokens', uncachedInput:'Uncached input', retryHint:'Refresh to retry. If this continues, check that your local sources are accessible.',
         subtitle: 'Reading local Codex session logs',
         refresh: 'Refresh',
         refreshTitle: 'Rescan local logs',
@@ -6670,7 +5975,7 @@ HTML = r"""<!doctype html>
       updateRemoteButton();
       updatePeriodButtons();
       if (state.generatedAt) {
-        document.getElementById('codexHome').textContent = `${state.codexHome || ''} · ${fmtDate(state.generatedAt)} ${t('scanned')}`;
+        renderSourceStatus();
       }
     }
 
@@ -7016,7 +6321,7 @@ HTML = r"""<!doctype html>
         state.customStartDate = data.period?.start_date || requestedStart;
         state.customEndDate = data.period?.end_date || requestedEnd || state.customStartDate;
       }
-      document.getElementById('codexHome').textContent = `${state.codexHome || ''} · ${fmtDate(state.generatedAt)} ${t('scanned')}`;
+      document.getElementById('codexHome').textContent = `${state.codexHome || ''} · ${fmtDate(state.generatedAt)} ${t('scanned')} · ${state.codexSources.filter(s => s.status === 'available').length}/${state.codexSources.length} local sources · +${state.codexSources.slice(1).reduce((n, s) => n + (s.newly_contributed_sessions || 0), 0)} additional sessions`;
       updateRemoteButton();
       populateEnvironmentFilter();
       populateModelFilter();
@@ -7080,7 +6385,7 @@ HTML = r"""<!doctype html>
         state.periodCache.set(cacheKey, data);
         await applySessionData(data, requestedPeriod, requestedStart, requestedEnd, selectTop);
       } catch (err) {
-        document.getElementById('sessionRows').innerHTML = `<tr><td colspan="8" class="error">${escapeHtml(t('loadFailed', { message: err.message }))}</td></tr>`;
+        document.getElementById('sessionRows').innerHTML = `<tr><td colspan="8" class="error">${escapeHtml(t('loadFailed', { message: err.message }) + ' ' + t('retryHint'))}</td></tr>`;
       } finally {
         refreshBtn.disabled = false;
         refreshBtn.textContent = t('refresh');
@@ -7492,12 +6797,24 @@ HTML = r"""<!doctype html>
     }
 
     function renderAll() {
+      const restoreFocus = captureListFocus();
       renderMetrics();
+      renderSourceStatus();
+      syncPresentationState();
       updatePeriodButtons();
       updateViewButtons();
       document.getElementById('limitSelect').disabled = state.viewMode === 'project';
       renderTable();
+      restoreFocus();
+      const selectionVisible = state.selectedUid && currentSelectableRows().some(row => row.uid === state.selectedUid);
+      if (!selectionVisible) clearDetails();
+      else if (document.getElementById('detailsBody').dataset.uid !== state.selectedUid) {
+        const cached = state.detailCache.get(`${state.snapshotToken}|${state.selectedUid}`);
+        if (cached) renderDetails(cached);
+      }
       if (state.calendarOpen) renderCalendar();
+      document.querySelectorAll('th[data-sort]').forEach(th => th.setAttribute('aria-sort', th.dataset.sort === state.sortKey ? (state.sortDir === 'asc' ? 'ascending' : 'descending') : 'none'));
+      document.querySelectorAll('[data-period-button],[data-view-button],[data-lang-button]').forEach(button => button.setAttribute('aria-pressed', String(button.classList.contains('active'))));
     }
 
     function setPeriod(period) {
@@ -7964,21 +7281,23 @@ HTML = r"""<!doctype html>
       const sessionHint = environmentHint
         ? t('metricSessionsHintWithEnvs', { active: fmt(summary.active_count), archived: fmt(summary.archived_count), envs: environmentHint })
         : t('metricSessionsHint', { active: fmt(summary.active_count), archived: fmt(summary.archived_count) });
-      const metrics = [
-        [t('metricSessions'), fmt(summary.session_count), sessionHint],
-        [t('metricPeriodTotalTokens', { period: periodLabel() }), fmtCompact(usage.total_tokens), fmt(usage.total_tokens)],
-        [t('metricCost'), fmtUsd(summary.estimated_cost_usd), t('metricCostHint', { count: fmt(summary.estimated_cost_known_count) })],
-        [t('metricInput'), fmtCompact(usage.input_tokens), fmt(usage.input_tokens)],
-        [t('metricCached'), fmtCompact(usage.cached_input_tokens), fmt(usage.cached_input_tokens)],
-        [t('metricOutput'), fmtCompact(usage.output_tokens), fmt(usage.output_tokens)],
-      ];
-      document.getElementById('metrics').innerHTML = metrics.map(([label, value, hint]) => `
-        <div class="metric">
-          <div class="label">${escapeHtml(label)}</div>
-          <div class="value">${escapeHtml(value)}</div>
-          <div class="hint">${escapeHtml(hint)}</div>
+      const metric = (label, value, hint, cls = '') => `
+        <div class="metric ${cls}"><div class="label">${escapeHtml(label)}</div>
+        <div class="value">${escapeHtml(value)}</div><div class="hint">${escapeHtml(hint)}</div></div>`;
+      document.getElementById('metrics').innerHTML = `
+        ${metric(t('totalOverview'), fmtCompact(usage.total_tokens), `${fmt(usage.total_tokens)} · ${periodLabel()}`, 'metric-primary')}
+        <div class="metric-cluster">
+          ${metric(t('metricInput'), fmtCompact(usage.input_tokens), fmt(usage.input_tokens))}
+          ${metric(t('metricCached'), fmtCompact(usage.cached_input_tokens), `${fmt(usage.cached_input_tokens)} · ${t('subsetInput')}`, 'metric-subset')}
         </div>
-      `).join('');
+        <div class="metric-cluster">
+          ${metric(t('metricOutput'), fmtCompact(usage.output_tokens), fmt(usage.output_tokens))}
+          ${metric(t('reasoning'), fmtCompact(usage.reasoning_output_tokens), `${fmt(usage.reasoning_output_tokens)} · ${t('subsetOutput')}`, 'metric-subset')}
+        </div>
+        <div class="metric-cluster">
+          ${metric(t('apiEquivalent'), fmtUsd(summary.estimated_cost_usd), t('metricCostHint', { count: fmt(summary.estimated_cost_known_count) }))}
+          ${metric(t('metricSessions'), fmt(summary.session_count), sessionHint, 'metric-subset metric-sessions')}
+        </div>`;
     }
 
     function renderTable() {
@@ -8121,6 +7440,12 @@ HTML = r"""<!doctype html>
 
     function bindTableInteractions() {
       document.querySelectorAll('#sessionRows tr[data-uid]').forEach(row => {
+        row.tabIndex = 0;
+        row.setAttribute('aria-selected', String(row.dataset.uid === state.selectedUid));
+        row.addEventListener('keydown', event => {
+          if (event.target !== row || !['Enter', ' '].includes(event.key)) return;
+          event.preventDefault(); showDetails(row.dataset.uid);
+        });
         row.addEventListener('click', () => showDetails(row.dataset.uid));
       });
       document.querySelectorAll('[data-task-toggle-row]').forEach(row => {
@@ -8129,7 +7454,7 @@ HTML = r"""<!doctype html>
           toggleTaskGroup(row.dataset.taskToggleRow);
         });
         row.addEventListener('keydown', event => {
-          if (event.key !== 'Enter' && event.key !== ' ') return;
+          if (event.target !== row || (event.key !== 'Enter' && event.key !== ' ')) return;
           event.preventDefault();
           toggleTaskGroup(row.dataset.taskToggleRow);
         });
@@ -8159,6 +7484,7 @@ HTML = r"""<!doctype html>
     }
 
     function clearDetails() {
+      document.getElementById('detailsBody').dataset.uid = '';
       document.getElementById('detailStatus').textContent = t('notSelected');
       document.getElementById('detailsBody').innerHTML = `<div class="empty">${escapeHtml(t('selectRow'))}</div>`;
     }
@@ -8167,7 +7493,7 @@ HTML = r"""<!doctype html>
       state.selectedUid = uid;
       const requestedToken = state.snapshotToken;
       const cacheKey = `${requestedToken}|${uid}`;
-      if (renderRows) renderTable();
+      if (renderRows) { const restoreFocus = captureListFocus(); renderTable(); restoreFocus(); }
       const cachedDetail = state.detailCache.get(cacheKey);
       if (cachedDetail) {
         renderDetails(cachedDetail);
@@ -8195,12 +7521,15 @@ HTML = r"""<!doctype html>
         renderDetails(detail);
       } catch (err) {
         if (state.snapshotToken !== requestedToken || state.selectedUid !== uid) return;
-        document.getElementById('detailsBody').innerHTML = `<div class="error">${escapeHtml(t('detailFailed', { message: err.message }))}</div>`;
+        document.getElementById('detailsBody').innerHTML = `<div class="error">${escapeHtml(t('detailFailed', { message: err.message }) + ' ' + t('retryHint'))}</div>`;
         document.getElementById('detailStatus').textContent = t('failed');
       }
     }
 
     function renderDetails(detail) {
+      const inspector = document.getElementById('detailsBody');
+      const openSections = inspector.dataset.uid === detail.uid ? [...inspector.querySelectorAll('details[open]')].map(el => el.dataset.section) : [];
+      inspector.dataset.uid = detail.uid;
       const usage = usageOf(detail);
       const taskGroup = taskGroupForUid(detail.uid);
       const taskSummary = taskGroup && taskGroup.root.uid === detail.uid && taskGroup.subagentCount
@@ -8250,26 +7579,35 @@ HTML = r"""<!doctype html>
             ].join(' · '))}</div>
           </div>
         ` : ''}
+        <div class="section-label">${escapeHtml(t('usageLabel'))}</div>
+        <div class="notice">${escapeHtml(t('subsetInput'))} · ${escapeHtml(t('subsetOutput'))}</div>
         <div class="breakdown">
-          ${breakdownRow(t('input'), 'input', uncachedInputTokens, max, costs.input_tokens, unitPriceTooltip(priceSegments, 'input_tokens'))}
+          ${breakdownRow(t('uncachedInput'), 'input', uncachedInputTokens, max, costs.input_tokens, unitPriceTooltip(priceSegments, 'input_tokens'))}
           ${breakdownRow(t('cached'), 'cached', usage.cached_input_tokens, max, costs.cached_input_tokens, unitPriceTooltip(priceSegments, 'cached_input_tokens'))}
           ${breakdownRow(t('output'), 'output', usage.output_tokens, max, costs.output_tokens, unitPriceTooltip(priceSegments, 'output_tokens'))}
           ${breakdownRow(t('reasoning'), 'reasoning', usage.reasoning_output_tokens, max, costs.reasoning_output_tokens, unitPriceTooltip(priceSegments, 'reasoning_output_tokens', t('reasoningCostTitle')))}
         </div>
 
         <div class="section-label">${escapeHtml(t('cumulativeChart'))}</div>
-        <canvas id="timelineCanvas" width="720" height="220"></canvas>
+        <canvas id="timelineCanvas" width="720" height="220" tabindex="0" role="img" aria-label="${escapeHtml(t('cumulativeChart'))}"></canvas>
+        <div class="curve-caption"><span>${escapeHtml(fmtDate(detail.start_at))}</span><span>${escapeHtml(fmtDate(detail.end_at))}</span></div>
+        <div class="notice" id="curveTooltip" role="status" aria-live="polite">${escapeHtml(t('chartHelp'))}</div>
 
-        <div class="section-label">${escapeHtml(t('metadata'))}</div>
+        <div class="section-label">${escapeHtml(t('contextLabel'))}</div>
         <div class="detail-meta">
           ${kv(t('totalTokens'), fmt(usage.total_tokens))}
           ${kv(t('cost'), fmtUsd(detail.estimated_cost_usd))}
           ${kv(t('cachePercent'), detail.cached_input_percent == null ? '' : detail.cached_input_percent + '%')}
+          ${kv('Model attribution', detail.model_attribution || 'unknown')}
+          ${kv('Models · event tokens', Object.entries(detail.model_usage || {}).map(([model, u]) => `${model}: ${fmt(u.total_tokens)}`).join(' · '))}
           ${kv(t('reasoningEffort'), detail.effort || 'N/A')}
           ${kv(t('serviceTier'), serviceTierLabel(detail) || 'N/A')}
           ${kv(t('time'), `${fmtRelativeTime(detail.end_at)} (${fmtDate(detail.start_at)} - ${fmtDate(detail.end_at)})`)}
           ${kv(t('totalDuration'), fmtDuration(detail.duration_ms_total))}
           ${kv(t('ttftAvg'), fmtDuration(detail.time_to_first_token_ms_avg))}
+        </div>
+        <details class="provenance-disclosure" data-section="provenance"><summary>${escapeHtml(t('provenanceLabel'))}</summary>
+        <div class="detail-meta">
           ${kv(t('environment'), detail.environment || '')}
           ${kv(t('project'), detail.project || '')}
           ${kv(t('projectRoot'), detail.project_root || '', 'path')}
@@ -8278,6 +7616,7 @@ HTML = r"""<!doctype html>
           ${kv(t('cwd'), detail.cwd || '', 'path')}
           ${kv(t('codexHome'), detail.codex_home || '', 'path')}
           ${kv(t('logFile'), detail.path || '', 'path')}
+          ${kv(state.lang === 'zh' ? '贡献文件' : 'Contributing files', (detail.provenance || []).map(p => p.path).join(' · '), 'path')}
           ${kv('Session ID', detail.session_id || '', 'path')}
           ${detail.is_subagent ? kv(t('threadType'), t('subagent')) : ''}
           ${detail.parent_thread_id ? kv(t('parentThread'), detail.parent_thread_id, 'path') : ''}
@@ -8286,15 +7625,18 @@ HTML = r"""<!doctype html>
           ${detail.is_subagent && detail.fork_usage_resolved === false ? kv(t('forkBaselineStatus'), t('forkBaselineUnresolved')) : ''}
         </div>
 
-        ${detail.first_user_prompt ? `<div class="section-label">${escapeHtml(t('firstUserPrompt'))}</div><div class="notice">${escapeHtml(detail.first_user_prompt)}</div>` : ''}
-        ${detail.last_agent_preview ? `<div class="section-label">${escapeHtml(t('lastReplySummary'))}</div><div class="notice">${escapeHtml(detail.last_agent_preview)}</div>` : ''}
+        </details>
+        ${detail.first_user_prompt ? `<details class="provenance-disclosure" data-section="firstUserPrompt"><summary>${escapeHtml(t('firstUserPrompt'))}</summary><div class="notice">${escapeHtml(detail.first_user_prompt)}</div></details>` : ''}
+        ${detail.last_agent_preview ? `<details class="provenance-disclosure" data-section="lastReplySummary"><summary>${escapeHtml(t('lastReplySummary'))}</summary><div class="notice">${escapeHtml(detail.last_agent_preview)}</div></details>` : ''}
 
         <div class="section-label">${escapeHtml(t('toolCalls'))}</div>
         ${toolRows ? `<table class="mini-table"><thead><tr><th>${escapeHtml(t('tool'))}</th><th>${escapeHtml(t('count'))}</th></tr></thead><tbody>${toolRows}</tbody></table>` : `<div class="notice">${escapeHtml(t('noToolCalls'))}</div>`}
 
-        <div class="section-label">${escapeHtml(t('timelineDetails'))}</div>
+        <details class="provenance-disclosure" data-section="fullTimeline"><summary>${escapeHtml(t('fullTimeline'))}</summary>
         ${timelineRows ? `<div class="table-wrap" style="max-height:260px"><table class="mini-table timeline-table"><thead><tr><th>${escapeHtml(t('timelineTime'))}</th><th>${escapeHtml(t('serviceTier'))}</th><th>${escapeHtml(t('timelineTotal'))}</th><th>${escapeHtml(t('input'))}</th><th>${escapeHtml(t('cached'))}</th><th>${escapeHtml(t('cacheWrite'))}</th><th>${escapeHtml(t('output'))}</th><th>${escapeHtml(t('reasoning'))}</th></tr></thead><tbody>${timelineRows}</tbody></table></div>` : `<div class="notice">${escapeHtml(t('noTimeline'))}</div>`}
+        </details>
       `;
+      inspector.querySelectorAll('details[data-section]').forEach(el => { el.open = openSections.includes(el.dataset.section); });
       drawTimeline(detail.timeline || []);
     }
 
@@ -8357,53 +7699,52 @@ HTML = r"""<!doctype html>
       if (!canvas) return;
       const rect = canvas.getBoundingClientRect();
       const dpr = window.devicePixelRatio || 1;
-      canvas.width = Math.max(320, Math.floor(rect.width * dpr));
+      canvas.width = Math.max(1, Math.floor(rect.width * dpr));
       canvas.height = Math.floor(150 * dpr);
       const ctx = canvas.getContext('2d');
       ctx.scale(dpr, dpr);
-      const width = canvas.width / dpr;
-      const height = canvas.height / dpr;
-      ctx.clearRect(0, 0, width, height);
-      ctx.fillStyle = '#fbfcfc';
-      ctx.fillRect(0, 0, width, height);
-      ctx.strokeStyle = '#d9dfdd';
-      ctx.lineWidth = 1;
-      for (let i = 1; i <= 3; i++) {
-        const y = Math.round((height / 4) * i);
-        ctx.beginPath();
-        ctx.moveTo(10, y);
-        ctx.lineTo(width - 10, y);
-        ctx.stroke();
-      }
-
+      const width = canvas.width / dpr, height = 150;
+      const css = getComputedStyle(document.documentElement);
+      const color = name => css.getPropertyValue(name).trim();
       const points = timeline.map(row => Number(row.total_token_usage?.total_tokens || 0));
-      if (!points.length) {
-        ctx.fillStyle = '#65716c';
-        ctx.fillText(t('noCurve'), 14, 24);
-        return;
+      ctx.clearRect(0, 0, width, height);
+      ctx.fillStyle = color('--panel'); ctx.fillRect(0, 0, width, height);
+      ctx.font = '11px "Segoe UI", sans-serif';
+      if (!points.length) { ctx.fillStyle = color('--muted'); ctx.fillText(t('noCurve'), 10, 24); return; }
+      const max = Math.max(1, ...points), min = Math.min(0, ...points), span = Math.max(1, max - min);
+      const left = 56, right = Math.max(left + 1, width - 12), top = 14, bottom = height - 24;
+      ctx.lineWidth = 1;
+      for (let i = 0; i <= 3; i++) {
+        const y = top + (bottom - top) * i / 3;
+        ctx.strokeStyle = color('--line'); ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(right, y); ctx.stroke();
+        ctx.fillStyle = color('--muted'); ctx.textAlign = 'right';
+        ctx.fillText(fmtCompact(max - span * i / 3), left - 8, y + 4);
       }
-      const max = Math.max(1, ...points);
-      const min = Math.min(0, ...points);
-      const span = Math.max(1, max - min);
-      const left = 12;
-      const right = width - 12;
-      const top = 12;
-      const bottom = height - 22;
-      ctx.strokeStyle = '#0f7b63';
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      points.forEach((value, index) => {
-        const x = points.length === 1 ? left : left + (right - left) * index / (points.length - 1);
-        const y = bottom - (bottom - top) * (value - min) / span;
-        if (index === 0) ctx.moveTo(x, y);
-        else ctx.lineTo(x, y);
-      });
-      ctx.stroke();
-      ctx.fillStyle = '#17201d';
-      ctx.font = '12px system-ui, sans-serif';
-      ctx.fillText(fmtCompact(max), 14, 18);
-      ctx.fillStyle = '#65716c';
-      ctx.fillText(t('countPoints', { count: points.length }), 14, height - 8);
+      const xy = index => [points.length === 1 ? left : left + (right - left) * index / (points.length - 1), bottom - (bottom - top) * (points[index] - min) / span];
+      const paintLine = () => {
+        ctx.strokeStyle = color('--accent'); ctx.lineWidth = 2; ctx.beginPath();
+        points.forEach((_, index) => { const [x,y] = xy(index); if (!index) ctx.moveTo(x,y); else ctx.lineTo(x,y); });
+        ctx.stroke();
+        const [x,y] = xy(points.length - 1); ctx.fillStyle = color('--accent'); ctx.beginPath(); ctx.arc(x,y,2.5,0,Math.PI*2); ctx.fill();
+      };
+      paintLine();
+      ctx.textAlign = 'left'; ctx.fillStyle = color('--muted'); ctx.fillText(t('countPoints', {count:points.length}), left, height - 4);
+      canvas.setAttribute('aria-label', `${t('cumulativeChart')}: ${fmt(points[points.length - 1])} ${t('totalTokens')}. ${t('chartHelp')}`);
+      let active = points.length - 1;
+      const describe = index => {
+        active = Math.max(0, Math.min(points.length - 1, index));
+        const tooltip = document.getElementById('curveTooltip');
+        if (tooltip) tooltip.textContent = `${fmtDate(timeline[active]?.timestamp)} · ${fmt(points[active])} ${t('totalTokens')}`;
+      };
+      canvas.onpointermove = event => {
+        const index = Math.round((event.offsetX - left) / Math.max(1,right-left) * (points.length-1));
+        describe(index);
+      };
+      canvas.onkeydown = event => {
+        if (!['ArrowLeft','ArrowRight','Home','End'].includes(event.key)) return;
+        event.preventDefault();
+        describe(event.key === 'Home' ? 0 : event.key === 'End' ? points.length - 1 : active + (event.key === 'ArrowRight' ? 1 : -1));
+      };
     }
 
     function updateRemoteButton() {
@@ -8416,10 +7757,18 @@ HTML = r"""<!doctype html>
     function openRemoteModal() {
       renderRemoteModal();
       document.getElementById('remoteModal').hidden = false;
+      document.body.classList.add('modal-open');
+      document.getElementById('dashboardMain').inert = true;
+      document.querySelector('header').inert = true;
+      document.getElementById('remoteCloseBtn').focus();
     }
 
     function closeRemoteModal() {
       document.getElementById('remoteModal').hidden = true;
+      document.body.classList.remove('modal-open');
+      document.getElementById('dashboardMain').inert = false;
+      document.querySelector('header').inert = false;
+      document.getElementById('remoteBtn').focus();
       state.pendingRemoteSnapshot = null;
     }
 
@@ -8582,10 +7931,85 @@ HTML = r"""<!doctype html>
       }
     }
 
+    // View-only helpers. No parsing, accounting, aggregation or source mutation.
+    function captureListFocus() {
+      const active = document.activeElement;
+      if (!active?.closest('#sessionRows')) return () => {};
+      const key = ['uid','projectToggle','projectMore','taskToggle','taskToggleRow'].find(name => active.dataset[name] !== undefined);
+      if (!key) return () => {};
+      const value = active.dataset[key];
+      return () => {
+        const replacement = [...document.querySelectorAll('#sessionRows tr,#sessionRows button')].find(el => el.dataset[key] === value);
+        replacement?.focus({preventScroll:true});
+      };
+    }
+    function renderSourceStatus() {
+      const available = state.codexSources.filter(s => s.status === 'available').length;
+      const summary = document.getElementById('codexHome');
+      const scanned = fmtDate(state.generatedAt);
+      summary.textContent = `${available}/${state.codexSources.length} ${t('sourcesLabel')} · ${scanned}`;
+      summary.title = `${t('latestScan')}: ${scanned}`;
+      document.getElementById('sourceDisclosure').classList.toggle('has-warning', available < state.codexSources.length);
+      document.getElementById('sourceStatusBody').innerHTML = state.codexSources.map(source => `
+        <div class="source-entry"><strong>${escapeHtml(source.label)} · ${escapeHtml(t(source.status === 'available' ? 'available' : 'unavailable'))}</strong>
+          <p>${escapeHtml(source.codex_home || '')}</p>
+          <p>${fmt(source.files_scanned || 0)} ${escapeHtml(t('sourceFiles'))} · +${fmt(source.newly_contributed_sessions || 0)} ${escapeHtml(t('sourceAdded'))}</p>
+          <p>${escapeHtml(t('latestScan'))}: ${escapeHtml(fmtDate(source.last_scanned_at || state.generatedAt))}</p>
+        </div>`).join('') || `<p class="notice">${escapeHtml(t('loading'))}</p>`;
+    }
+
+    function syncPresentationState() {
+      document.getElementById('calendarBtn').setAttribute('aria-expanded', String(state.calendarOpen));
+      document.querySelectorAll('[data-lang-button]').forEach(button => button.setAttribute('aria-pressed', String(button.dataset.langButton === state.lang)));
+    }
+
+    function applyAppearance() {
+      const preference = document.getElementById('themeSelect').value;
+      const dark = preference === 'dark' || (preference === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+      document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+      document.querySelector('meta[name="theme-color"]').content = dark ? '#191a1e' : '#f5f5f7';
+      const detail = state.detailCache.get(`${state.snapshotToken}|${state.selectedUid || ''}`);
+      if (detail) drawTimeline(detail.timeline || []);
+    }
+
+    function initPresentation() {
+      const appearance = document.getElementById('themeSelect');
+      try { appearance.value = localStorage.getItem('cousash-appearance') || 'system'; } catch (_) {}
+      if (!['light','dark','system'].includes(appearance.value)) appearance.value = 'system';
+      appearance.addEventListener('change', () => {
+        try { localStorage.setItem('cousash-appearance', appearance.value); } catch (_) {}
+        applyAppearance();
+      });
+      window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyAppearance);
+      applyAppearance();
+      const calendar = document.getElementById('calendarPopover');
+      new MutationObserver(() => {
+        syncPresentationState();
+        if (!calendar.hidden) calendar.querySelector('button:not([disabled])')?.focus();
+        else if (calendar.contains(document.activeElement)) document.getElementById('calendarBtn').focus();
+      }).observe(calendar, {attributes:true,attributeFilter:['hidden']});
+      document.getElementById('remoteModal').addEventListener('keydown', event => {
+        if (event.key === 'Escape') { event.preventDefault(); closeRemoteModal(); return; }
+        if (event.key !== 'Tab') return;
+        const buttons = [...event.currentTarget.querySelectorAll('button:not([disabled]),input:not([hidden]),select,a[href]')];
+        const first = buttons[0], last = buttons[buttons.length - 1];
+        if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+        else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+      });
+      document.addEventListener('keydown', event => {
+        if (event.key === 'Escape' && document.getElementById('sourceDisclosure').open) {
+          document.getElementById('sourceDisclosure').open = false;
+          document.getElementById('codexHome').focus();
+        }
+      });
+      document.addEventListener('click', event => {
+        if (!event.target.closest('#sourceDisclosure')) document.getElementById('sourceDisclosure').open = false;
+      });
+    }
+
     document.getElementById('refreshBtn').addEventListener('click', () => loadData(false));
     document.getElementById('remoteBtn').addEventListener('click', () => {
-      if (state.remotes.length) openRemoteModal();
-      else chooseRemoteFile();
+      openRemoteModal();
     });
     document.getElementById('remoteImportBtn').addEventListener('click', chooseRemoteFile);
     document.getElementById('remoteCloseBtn').addEventListener('click', closeRemoteModal);
@@ -8619,6 +8043,9 @@ HTML = r"""<!doctype html>
     });
     document.getElementById('limitSelect').addEventListener('change', event => { state.limit = event.target.value; renderAll(); });
     document.querySelectorAll('th[data-sort]').forEach(th => {
+      th.addEventListener('keydown', event => {
+        if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); th.click(); }
+      });
       th.addEventListener('click', () => {
         const key = th.dataset.sort;
         state.viewMode = key === 'total_tokens' ? 'total' : 'recent';
@@ -8642,6 +8069,7 @@ HTML = r"""<!doctype html>
       if (event.key === 'Escape' && state.calendarOpen) closeCalendar();
     });
 
+    initPresentation();
     applyStaticText();
     populateEnvironmentFilter();
     populateSourceFilter();
@@ -8681,6 +8109,8 @@ def make_handler(analyzer: CodexUsageAnalyzer) -> type[BaseHTTPRequestHandler]:
                         "ok": True,
                         "app": "codex-usage-dashboard",
                         "features": DASHBOARD_FEATURES,
+                        "implementation_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                        "persistent_cache_enabled": analyzer.persistent_cache is not None and not analyzer.persistent_cache._disabled,
                         "device_short_code": analyzer.remote_store.current_device_code if analyzer.remote_store else current_device_short_code(),
                     }
                 )
@@ -8985,6 +8415,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Do not auto-add the Windows ~/.codex directory when running under WSL.",
     )
+    parser.add_argument("--sources-config", type=Path, default=None, help="Explicit version-1 local source configuration; CLI --codex-home overrides its source list.")
     parser.add_argument("--host", default="127.0.0.1", help="Bind host. Defaults to 127.0.0.1.")
     parser.add_argument("--port", type=int, default=8765, help="Port to bind. Defaults to the fixed dashboard port 8765.")
     parser.add_argument(
@@ -9008,10 +8439,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    configured_sources, origins = source_configuration(args.sources_config)
     sources = (
         codex_sources_from_homes(args.codex_home)
         if args.codex_home
-        else default_codex_sources(include_windows=not args.no_auto_windows)
+        else configured_sources or default_codex_sources(include_windows=not args.no_auto_windows)
     )
     remote_store = RemoteSnapshotStore()
     persistent_cache = PersistentParseCache()
@@ -9020,6 +8452,7 @@ def main() -> int:
         remote_store=remote_store,
         persistent_cache=persistent_cache,
         parallel_workers=args.parse_workers,
+        source_origins=origins,
     )
     if args.export_snapshot is not None:
         body = analyzer.export_snapshot_json()

@@ -1,3 +1,4 @@
+import contextlib
 import datetime as dt
 import http.client
 import importlib.util
@@ -53,7 +54,7 @@ class CodexUsageDashboardTests(unittest.TestCase):
         sessions_dir = codex_home / "sessions"
         sessions_dir.mkdir(parents=True, exist_ok=True)
         path = sessions_dir / f"rollout-2026-07-10T10-00-00-{thread_id}.jsonl"
-        path.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+        path.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8", newline="\n")
         return path
 
     @staticmethod
@@ -237,7 +238,7 @@ class CodexUsageDashboardTests(unittest.TestCase):
                 },
             },
         ]
-        path.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+        path.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8", newline="\n")
         return path
 
     def test_parse_file_skips_synthetic_context_for_title(self) -> None:
@@ -294,7 +295,7 @@ class CodexUsageDashboardTests(unittest.TestCase):
                     },
                 },
             ]
-            path.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+            path.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8", newline="\n")
 
             analyzer = dashboard.CodexUsageAnalyzer(Path(temp_dir))
             summary, detail = analyzer.parse_file(path, "active")
@@ -327,7 +328,7 @@ class CodexUsageDashboardTests(unittest.TestCase):
             first_path.write_text(
                 "\n".join(json.dumps(row) for row in first_rows),
                 encoding="utf-8",
-            )
+             newline="\n")
 
             continued_path = sessions_dir / (
                 f"rollout-2026-07-10T11-00-00-{session_id}_continuation.jsonl"
@@ -348,7 +349,7 @@ class CodexUsageDashboardTests(unittest.TestCase):
             continued_path.write_text(
                 "\n".join(json.dumps(row) for row in continued_rows),
                 encoding="utf-8",
-            )
+             newline="\n")
 
             analyzer = dashboard.CodexUsageAnalyzer(codex_home)
             snapshot = analyzer.scan()
@@ -471,7 +472,7 @@ class CodexUsageDashboardTests(unittest.TestCase):
                     ]
                 ),
                 encoding="utf-8",
-            )
+             newline="\n")
 
             snapshot = dashboard.CodexUsageAnalyzer(codex_home).scan()
 
@@ -495,7 +496,7 @@ class CodexUsageDashboardTests(unittest.TestCase):
             second = {"timestamp": "2026-07-10T10:01:00Z", "type": "world_state", "payload": {}}
             first_line = json.dumps(first, separators=(",", ":")) + "\n"
             second_line = json.dumps(second, separators=(",", ":")) + "\n"
-            path.write_text(first_line + second_line, encoding="utf-8")
+            path.write_text(first_line + second_line, encoding="utf-8", newline="\n")
             stats = dashboard.RolloutReadStats()
 
             rows = dashboard.read_rollout_jsonl(path, stats=stats)
@@ -1158,14 +1159,14 @@ for (const service_tier of ['default', 'standard', '']) {
             analyzer = dashboard.CodexUsageAnalyzer(home, resolve_project_info=False)
             first = analyzer.scan("all", include_remotes=False)
             self.assertAlmostEqual(first["sessions"][0]["estimated_cost_usd"], 0.002)
-            with sqlite3.connect(home / "logs_2.sqlite") as connection:
+            with contextlib.closing(sqlite3.connect(home / "logs_2.sqlite")) as connection, connection:
                 connection.execute("CREATE TABLE logs (id INTEGER PRIMARY KEY, ts INTEGER, ts_nanos INTEGER, thread_id TEXT, target TEXT, feedback_log_body TEXT)")
                 base = int(dt.datetime(2026, 9, 5, tzinfo=dt.UTC).timestamp())
                 connection.execute("INSERT INTO logs VALUES (1, ?, 0, 'runtime-tier', 'codex_core::session::handlers', ?)", (base + 1, 'Submission sub=Submission { op: TurnInput { request: TurnInputRequest { thread_settings: ThreadSettingsOverrides { service_tier: Some(Some("priority")) }, start: TurnStartOptions { service_tier: None } } } }'))
             second = analyzer.scan("all", include_remotes=False)
             self.assertEqual(second["sessions"][0]["service_tiers"], ["priority"])
             self.assertAlmostEqual(second["sessions"][0]["estimated_cost_usd"], 0.004)
-            with sqlite3.connect(home / "logs_2.sqlite") as connection:
+            with contextlib.closing(sqlite3.connect(home / "logs_2.sqlite")) as connection, connection:
                 connection.execute("INSERT INTO logs VALUES (2, ?, 0, 'runtime-tier', 'codex_core::session::handlers', ?)", (base + 3, 'Submission sub=Submission { op: TurnInput { request: TurnInputRequest { thread_settings: ThreadSettingsOverrides { service_tier: Some(None) } } } }'))
             third = analyzer.scan("all", include_remotes=False)
             self.assertEqual(third["sessions"][0]["service_tiers"], ["priority", "default"])
@@ -1193,7 +1194,7 @@ for (const service_tier of ['default', 'standard', '']) {
             home = Path(temp_dir)
             self.assertEqual(dashboard.runtime_service_tier_events(home, {"thread"}), {})
             self.assertFalse((home / "logs_2.sqlite").exists())
-            with sqlite3.connect(home / "logs_2.sqlite"):
+            with contextlib.closing(sqlite3.connect(home / "logs_2.sqlite")):
                 pass
             self.assertEqual(dashboard.runtime_service_tier_events(home, {"thread"}), {})
 
@@ -1374,7 +1375,7 @@ for (const service_tier of ['default', 'standard', '']) {
                     },
                 },
             ]
-            path.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+            path.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8", newline="\n")
 
             analyzer = dashboard.CodexUsageAnalyzer(Path(temp_dir))
             summary, detail = analyzer.parse_file(path, "active")
@@ -1616,7 +1617,7 @@ for (const service_tier of ['default', 'standard', '']) {
                     },
                 },
             ]
-            path.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+            path.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8", newline="\n")
 
             analyzer = dashboard.CodexUsageAnalyzer(Path(temp_dir))
             _summary, detail = analyzer.parse_file(path, "active")
@@ -1736,7 +1737,7 @@ for (const service_tier of ['default', 'standard', '']) {
                     },
                 },
             ]
-            path.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+            path.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8", newline="\n")
 
             analyzer = dashboard.CodexUsageAnalyzer(Path(temp_dir))
             summary, detail = analyzer.parse_file(path, "active")
@@ -1858,7 +1859,7 @@ for (const service_tier of ['default', 'standard', '']) {
                     },
                 },
             ]
-            path.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+            path.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8", newline="\n")
 
             analyzer = dashboard.CodexUsageAnalyzer(Path(temp_dir))
             summary, detail = analyzer.parse_file(path, "active")
@@ -2232,7 +2233,7 @@ for (const service_tier of ['default', 'standard', '']) {
             parent_path.write_text(
                 "\n".join(json.dumps(row) for row in parent_rows),
                 encoding="utf-8",
-            )
+             newline="\n")
             changed_mtime_ns = previous_mtime_ns + 1_000_000
             os.utime(parent_path, ns=(changed_mtime_ns, changed_mtime_ns))
 
@@ -2456,7 +2457,7 @@ for (const service_tier of ['default', 'standard', '']) {
                     for row in initial_rows
                 ),
                 encoding="utf-8",
-            )
+             newline="\n")
             analyzer = dashboard.CodexUsageAnalyzer(codex_home)
             first = analyzer.scan("all")
             original_size = path.stat().st_size
@@ -2502,7 +2503,7 @@ for (const service_tier of ['default', 'standard', '']) {
                 )
                 + "\n",
                 encoding="utf-8",
-            )
+             newline="\n")
             analyzer = dashboard.CodexUsageAnalyzer(codex_home)
             first = analyzer.scan("all")
 
@@ -2546,7 +2547,7 @@ for (const service_tier of ['default', 'standard', '']) {
                     for row in initial_rows
                 ),
                 encoding="utf-8",
-            )
+             newline="\n")
             analyzer = dashboard.CodexUsageAnalyzer(codex_home)
             analyzer.scan("all")
 
@@ -2591,7 +2592,7 @@ for (const service_tier of ['default', 'standard', '']) {
                         path.write_text(
                             path.read_text(encoding="utf-8").replace("100", "200"),
                             encoding="utf-8",
-                        )
+                         newline="\n")
                         os.utime(
                             path,
                             ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000),
@@ -2671,7 +2672,7 @@ for (const service_tier of ['default', 'standard', '']) {
                     path.write_text(
                         path.read_text(encoding="utf-8").replace("100", "200"),
                         encoding="utf-8",
-                    )
+                     newline="\n")
                     os.utime(
                         path,
                         ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000),
@@ -2745,7 +2746,7 @@ for (const service_tier of ['default', 'standard', '']) {
                     for row in replacement_rows
                 ),
                 encoding="utf-8",
-            )
+             newline="\n")
             os.replace(replacement, path)
             second = analyzer.scan("all")
 
@@ -2776,7 +2777,7 @@ for (const service_tier of ['default', 'standard', '']) {
             path.write_text(
                 "".join(json.dumps(row, separators=(",", ":")) + "\n" for row in rows),
                 encoding="utf-8",
-            )
+             newline="\n")
             snapshot = analyzer.scan("all")
 
         self.assertEqual(snapshot["summary"]["usage"]["total_tokens"], 50)
@@ -2800,7 +2801,7 @@ for (const service_tier of ['default', 'standard', '']) {
             )
             first.scan("all")
             first.close()
-            with sqlite3.connect(cache_path) as connection:
+            with contextlib.closing(sqlite3.connect(cache_path)) as connection, connection:
                 connection.execute(
                     "UPDATE parsed_files SET parser_version = ?",
                     (dashboard.PARSE_CACHE_VERSION - 1,),
@@ -2918,7 +2919,7 @@ for (const service_tier of ['default', 'standard', '']) {
             )
             second.scan("all")
             second.close()
-            with sqlite3.connect(cache_path) as connection:
+            with contextlib.closing(sqlite3.connect(cache_path)) as connection, connection:
                 row_count = connection.execute("SELECT COUNT(*) FROM parsed_files").fetchone()[0]
 
         self.assertEqual(row_count, 0)
@@ -3032,7 +3033,7 @@ for (const service_tier of ['default', 'standard', '']) {
             codex_home = Path(temp_dir) / ".codex"
             path = codex_home / "sessions" / "rollout-2026-07-10T10-00-00-time-fallback.jsonl"
             path.parent.mkdir(parents=True)
-            path.write_text('{"type":"world_state","payload":{}}\n', encoding="utf-8")
+            path.write_text('{"type":"world_state","payload":{}}\n', encoding="utf-8", newline="\n")
             fallback_time = dt.datetime(2026, 7, 10, 12, 0, tzinfo=dt.UTC).timestamp()
             os.utime(path, (fallback_time, fallback_time))
             analyzer = dashboard.CodexUsageAnalyzer(codex_home)
@@ -3143,7 +3144,7 @@ for (const service_tier of ['default', 'standard', '']) {
             repo = root / "codex-usage-dashboard"
             worktree = root / "codex-usage-dashboard-feature"
             subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True, text=True)
-            (repo / "README.md").write_text("test\n", encoding="utf-8")
+            (repo / "README.md").write_text("test\n", encoding="utf-8", newline="\n")
             subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True, capture_output=True, text=True)
             subprocess.run(
                 ["git", "-C", str(repo), "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "init"],

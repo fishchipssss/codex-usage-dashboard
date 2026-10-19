@@ -1,14 +1,14 @@
 {
-  "name": "codex-usage-dashboard-skill",
-  "version": "0.1.0",
-  "description": "Codex-only skill for a local per-conversation Codex usage dashboard with tokens, output, cost estimates, cache hit rate, models, and reasoning effort.",
+  "name": "codex-usage-dashboard-community",
+  "version": "0.2.0",
+  "description": "Community fork with historical multi-profile usage reconciliation and a refined local dashboard.",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/luyh7/codex-usage-dashboard.git"
+    "url": "git+https://github.com/fishchipssss/codex-usage-dashboard.git"
   },
-  "homepage": "https://github.com/luyh7/codex-usage-dashboard#readme",
+  "homepage": "https://github.com/fishchipssss/codex-usage-dashboard#readme",
   "bugs": {
-    "url": "https://github.com/luyh7/codex-usage-dashboard/issues"
+    "url": "https://github.com/fishchipssss/codex-usage-dashboard/issues"
   },
   "bin": {
     "codex-usage-dashboard-skill": "bin/install.js"
@@ -31,7 +31,7 @@
     "cache-hit-rate",
     "local-dashboard"
   ],
-  "author": "",
+  "author": "fishchipssss",
   "license": "MIT",
   "engines": {
     "node": ">=18"
