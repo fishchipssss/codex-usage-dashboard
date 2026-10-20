@@ -33,6 +33,14 @@ It shows a searchable conversation list and a detail view for each session, incl
 
 ## Install With The Skills CLI
 
+### Windows: double-click an EXE
+
+Download **CodexUsageDashboard-Windows-x64.zip** from the [latest release](https://github.com/fishchipssss/codex-usage-dashboard/releases/latest), extract it, then double-click **CodexUsageDashboard.exe**. No Codex app, PowerShell, Python or Node.js is needed to launch it. You can create a desktop shortcut to the EXE.
+
+See [Windows instructions, local data and build details](docs/WINDOWS.md).
+
+### Codex skill
+
 Recommended global Codex install:
 
 ```bash

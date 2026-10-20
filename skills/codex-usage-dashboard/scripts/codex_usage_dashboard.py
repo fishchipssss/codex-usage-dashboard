@@ -1421,6 +1421,9 @@ def run_text_quiet(command: list[str]) -> str:
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             timeout=2.0,
         )
     except (OSError, subprocess.SubprocessError):
@@ -8108,6 +8111,7 @@ def make_handler(analyzer: CodexUsageAnalyzer) -> type[BaseHTTPRequestHandler]:
                     {
                         "ok": True,
                         "app": "codex-usage-dashboard",
+                        "process_id": os.getpid(),
                         "features": DASHBOARD_FEATURES,
                         "implementation_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                         "persistent_cache_enabled": analyzer.persistent_cache is not None and not analyzer.persistent_cache._disabled,

@@ -1,6 +1,6 @@
 {
   "name": "codex-usage-dashboard-community",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Community fork with historical multi-profile usage reconciliation and a refined local dashboard.",
   "repository": {
     "type": "git",
